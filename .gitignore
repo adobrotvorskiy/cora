@@ -1,0 +1,27 @@
+node_modules/
+# Chrome profile (cookies of the Telemost session), render cache, logs with meeting transcripts
+profile/
+cache/
+logs/
+state/
+_internal/
+# people and company data: the real roster, persona, playbook, phrases and STT fixes stay on this
+# machine; the repo carries fictional stand-ins config/*.example.* (see src/config.js contentPath)
+config/people.json
+config/persona.md
+config/playbook.md
+config/phrases.json
+config/stt_fixes.json
+# secrets and machine-local overrides: keys live in .env files, never in the repo
+.env
+.env.*
+*.local.json
+config/settings.local.json
+# recorded audio (meetings, probes); the loopback fixture is synthetic and stays
+*.pcm
+*.wav
+!tests/fixtures/loopback_capture.wav
+# editor / OS noise
+.claude/settings.local.json
+.DS_Store
+Thumbs.db

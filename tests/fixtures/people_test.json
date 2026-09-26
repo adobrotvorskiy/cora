@@ -1,0 +1,20 @@
+{
+  "_comment": "Test roster (WP6 unit tests): a snapshot of the 18.09 people.json WITH namesakes, so the alias/namesake logic keeps being tested whatever the real roster looks like.",
+  "host_display_name": "Кора (ИИ-ведущая)",
+  "first_always": "orlov_y",
+  "ignore_participants": ["Синк Стендапов", "Кора (ИИ-ведущая)", "Тест-слушатель", "Гость"],
+  "people": [
+    { "id": "orlov_y", "display": "Ярослав Орлов", "aliases": ["Ярослав Орлов", "Орлов Ярослав", "Слава Орлов", "Yaroslav Orlov", "Yaroslav Orlov", "Orlov Yaroslav"], "spoken": "Яросла́в", "vocative": "Яросла́в", "surname_spoken": "Орло́в", "role": "CEO", "gender": "m" },
+    { "id": "orlov_andrey", "display": "Андрей Орлов", "aliases": ["Андрей Орлов", "Орлов Андрей", "Andrey Orlov"], "spoken": "Андре́й", "vocative": "Андре́й", "surname_spoken": "Орло́в", "gender": "m", "disambiguate_with_surname": true },
+    { "id": "nevsky_g", "display": "Глеб Невский", "aliases": ["Глеб Невский", "Невский Глеб", "Gleb Nevsky"], "spoken": "Гле́б", "vocative": "Гле́б", "surname_spoken": "Не́вский", "role": "CTO", "gender": "m" },
+    { "id": "tkach_t", "display": "Тимур Ткач", "aliases": ["Тимур Ткач", "Ткач Тимур", "Тима Ткач", "Timur Tkach"], "spoken": "Тиму́р", "vocative": "Тиму́р", "surname_spoken": "Тка́ч", "role": "техлид", "gender": "m" },
+    { "id": "belozersky_s", "display": "Сергей Белозерский", "aliases": ["Сергей Белозерский", "Белозерский Сергей", "Серёжа Белозерский", "Sergey Belozersky"], "spoken": "Серге́й", "vocative": "Серге́й", "surname_spoken": "Белозе́рский", "role": "COO", "gender": "m" },
+    { "id": "belozerskaya_n", "display": "Нина Белозерская", "aliases": ["Нина Белозерская", "Белозерская Нина", "Nina Belozerskaya"], "spoken": "Ни́на", "vocative": "Ни́на", "surname_spoken": "Белозе́рская", "gender": "f" },
+    { "id": "boyko_s", "display": "Савва Бойко", "aliases": ["Савва Бойко", "Бойко Савва", "Savva Boyko", "Савва"], "spoken": "Са́вва", "vocative": "Са́вва", "surname_spoken": "Бо́йко", "gender": "m", "disambiguate_with_surname": true },
+    { "id": "stepanov_m", "display": "Матвей Степанов", "aliases": ["Матвей Степанов", "Степанов Матвей", "Митя Степанов", "Matvey Stepanov"], "spoken": "Матве́й", "vocative": "Матве́й", "surname_spoken": "Степа́нов", "gender": "m" },
+    { "id": "rybakov_o", "display": "Олег Рыбаков", "aliases": ["Олег Рыбаков", "Рыбаков Олег", "Oleg Rybakov"], "spoken": "О́лег", "vocative": "О́лег", "surname_spoken": "Рыбако́в", "gender": "m", "disambiguate_with_surname": true },
+    { "id": "lapin_o", "display": "Олег Лапин", "aliases": ["Олег Лапин", "Лапин Олег", "Oleg Lapin"], "spoken": "О́лег", "vocative": "О́лег", "surname_spoken": "Ла́пин", "gender": "m", "disambiguate_with_surname": true },
+    { "id": "smirnova_a", "display": "Алина Смирнова", "aliases": ["Алина Смирнова", "Алина Смирнова", "Смирнова Алина", "Alina Smirnova"], "spoken": "Али́на", "vocative": "Али́на", "surname_spoken": "Смирнова", "gender": "f" },
+    { "id": "ignat", "display": "Игнат Галиев", "aliases": ["Игнат", "Ignat", "Игнат Галиев"], "spoken": "Игна́т", "vocative": "Игна́т", "surname_spoken": "Гали́ев", "gender": "m" }
+  ]
+}

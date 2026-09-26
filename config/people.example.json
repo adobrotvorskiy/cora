@@ -1,0 +1,158 @@
+{
+  "_comment": "Fictional team: the stand-in for config/people.json, which holds the real roster and stays local (.gitignore). Copy this file to people.json and fill in your team.",
+  "host_display_name": "Кора (ИИ-ведущая)",
+  "team_name": "Acme",
+  "keywords": [
+    "Acme",
+    "PRJX",
+    "Агрохолдинг",
+    "Blue Line"
+  ],
+  "first_always": "orlov_y",
+  "ignore_participants": [
+    "Синк Стендапов",
+    "Кора (ИИ-ведущая)",
+    "Тест-слушатель",
+    "Гость"
+  ],
+  "people": [
+    {
+      "id": "orlov_y",
+      "display": "Ярослав Орлов",
+      "aliases": [
+        "Ярослав Орлов",
+        "Орлов Ярослав",
+        "Слава Орлов",
+        "Yaroslav Orlov",
+        "Slava Orlov"
+      ],
+      "spoken": "Сла́ва",
+      "vocative": "Сла́ва",
+      "vocative_gen": "Сла́вы",
+      "vocative_acc": "Сла́ву",
+      "surname_spoken": "Орло́в",
+      "role": "CEO, основатель",
+      "gender": "m",
+      "exclude": false
+    },
+    {
+      "id": "nevsky_g",
+      "display": "Глеб Невский",
+      "aliases": [
+        "Глеб Невский",
+        "Невский Глеб",
+        "Глеб",
+        "Gleb Nevsky"
+      ],
+      "spoken": "Гле́б",
+      "vocative": "Гле́б",
+      "surname_spoken": "Не́вский",
+      "role": "CTO, сооснователь",
+      "gender": "m",
+      "exclude": false
+    },
+    {
+      "id": "tkach_t",
+      "display": "Тимур Ткач",
+      "aliases": [
+        "Тимур Ткач",
+        "Ткач Тимур",
+        "Тима Ткач",
+        "Тимур",
+        "Тима",
+        "Timur Tkach"
+      ],
+      "spoken": "Ти́ма",
+      "vocative": "Ти́ма",
+      "surname_spoken": "Тка́ч",
+      "role": "техлид",
+      "gender": "m",
+      "exclude": false
+    },
+    {
+      "id": "belozersky_s",
+      "display": "Сергей Белозерский",
+      "aliases": [
+        "Сергей Белозерский",
+        "Белозерский Сергей",
+        "Серёжа Белозерский",
+        "Сережа Белозерский",
+        "Sergey Belozersky"
+      ],
+      "spoken": "Серёжа",
+      "vocative": "Серёжа",
+      "surname_spoken": "Белозе́рский",
+      "role": "COO",
+      "gender": "m",
+      "exclude": false
+    },
+    {
+      "id": "zuev_k",
+      "display": "Кирилл Зуев",
+      "aliases": [
+        "Кирилл Зуев",
+        "Зуев Кирилл",
+        "Кир Зуев",
+        "Кирилл",
+        "Кир",
+        "Kirill Zuev"
+      ],
+      "spoken": "Ки́р",
+      "vocative": "Ки́р",
+      "surname_spoken": "Зу́ев",
+      "role": "",
+      "gender": "m",
+      "exclude": false
+    },
+    {
+      "id": "boyko_s",
+      "display": "Савва Бойко",
+      "aliases": [
+        "Савва Бойко",
+        "Бойко Савва",
+        "Савва",
+        "Savva Boyko"
+      ],
+      "spoken": "Са́вва",
+      "vocative": "Са́вва",
+      "surname_spoken": "Бо́йко",
+      "role": "",
+      "gender": "m",
+      "exclude": false
+    },
+    {
+      "id": "ignat",
+      "display": "Игнат Галиев",
+      "aliases": [
+        "Игнат Галиев",
+        "Галиев Игнат",
+        "Игнат",
+        "Ignat Galiev"
+      ],
+      "spoken": "Игна́т",
+      "vocative": "Игна́т",
+      "surname_spoken": "Гали́ев",
+      "role": "",
+      "gender": "m",
+      "exclude": false
+    },
+    {
+      "id": "stepanov_m",
+      "display": "Матвей Степанов",
+      "aliases": [
+        "Матвей Степанов",
+        "Степанов Матвей",
+        "Митя Степанов",
+        "Матвей",
+        "Митя",
+        "Matvey Stepanov"
+      ],
+      "spoken": "Ми́тя",
+      "vocative": "Ми́тя",
+      "surname_spoken": "Степа́нов",
+      "role": "",
+      "gender": "m",
+      "exclude": false
+    }
+  ]
+}

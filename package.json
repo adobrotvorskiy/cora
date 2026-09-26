@@ -1,0 +1,20 @@
+{
+  "name": "standup-host",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI host for the Acme morning standup in Yandex Telemost (see PLAN.md)",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "check": "node src/main.js --check",
+    "test": "node --test --import ./tests/helpers/examples_only.mjs \"tests/unit/*.test.js\""
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.14.5",
+    "@grpc/proto-loader": "^0.8.1",
+    "playwright-core": "^1.63.0",
+    "ws": "^8.21.3"
+  }
+}
