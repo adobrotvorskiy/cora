@@ -13,19 +13,31 @@
 // ourselves, strip the BOM (or decode UTF-16LE), and parse it with
 // util.parseEnv(), the same built-in dotenv parser loadEnvFile uses.
 
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseEnv } from 'node:util';
 
 const SRC_DIR = dirname(fileURLToPath(import.meta.url));
 
-/** scripts/standup_host */
+/** The app (its own repository; locally it may also sit at <template>/scripts/standup_host). */
 export const APP_ROOT = resolve(SRC_DIR, '..');
-/** Repository root (holds .env.personal / .env.local). */
-export const REPO_ROOT = resolve(SRC_DIR, '../../..');
 /** Env files in precedence order (first wins). */
 export const ENV_FILES = ['.env.personal', '.env.local'];
+/**
+ * Where .env.personal / .env.local are read from: STANDUP_ENV_DIR, else the app root when it has
+ * them, else the enclosing repository two levels up (<template>/scripts/standup_host), else the
+ * app root. In the cloud the keys come from the environment and no file is needed.
+ */
+export const REPO_ROOT = envRoot();
+
+function envRoot() {
+  if (process.env.STANDUP_ENV_DIR) return resolve(process.env.STANDUP_ENV_DIR);
+  const has = (dir) => ENV_FILES.some((f) => existsSync(join(dir, f)));
+  if (has(APP_ROOT)) return APP_ROOT;
+  const outer = resolve(APP_ROOT, '../..');
+  return has(outer) ? outer : APP_ROOT;
+}
 
 const SECRET_NAME = /KEY|TOKEN|SECRET|PASS|PWD|AUTH|CRED/i;
 const MIN_SECRET_LEN = 12;

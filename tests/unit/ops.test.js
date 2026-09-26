@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { after, test } from 'node:test';
 import { STOP_FILE, loadSettings } from '../../src/config.js';
+import { APP_ROOT } from '../../src/env.js';
 import { clearStopFlag, isStopRequested, requestStop, watchStopFlag } from '../../src/ops/stopflag.js';
 import { API_BASE, MAX_MESSAGE_CHARS, formatAlert, formatSummary, runCli, sendAlert, sendSummary } from '../../src/ops/telegram.js';
 
@@ -264,7 +265,7 @@ test('CLI: usage errors and --dry-run send nothing; exit codes', async () => {
 // --- stop flag ---------------------------------------------------------------
 
 test('STOP_FILE is state/STOP inside the app', () => {
-  assert.match(STOP_FILE, /[\\/]scripts[\\/]standup_host[\\/]state[\\/]STOP$/);
+  assert.equal(STOP_FILE, join(APP_ROOT, 'state', 'STOP'));
 });
 
 test('stop flag: request / detect / clear, directory created on demand', () => {

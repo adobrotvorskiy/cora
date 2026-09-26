@@ -18,8 +18,8 @@ after(() => {
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
 });
 
-test('paths: APP_ROOT is scripts/standup_host inside REPO_ROOT', () => {
-  assert.equal(APP_ROOT, join(REPO_ROOT, 'scripts', 'standup_host'));
+test('paths: env files come from the app root or the enclosing repository (<repo>/scripts/standup_host)', () => {
+  assert.ok(REPO_ROOT === APP_ROOT || APP_ROOT === join(REPO_ROOT, 'scripts', 'standup_host') || Boolean(process.env.STANDUP_ENV_DIR), REPO_ROOT);
   assert.deepEqual(ENV_FILES, ['.env.personal', '.env.local']);
 });
 
