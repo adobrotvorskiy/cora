@@ -97,6 +97,71 @@ export function parseActionText(content) {
 }
 
 /**
+ * Top-level fields of a JSON object that is still streaming in, only those whose values are
+ * complete: '{"why":"…","action":"answer","to":null,"text":"При' -> {why, action, to}. Anything
+ * before the first «{» (a ```json fence, prose) is skipped. Lets the host start synthesizing
+ * `text` while the model is still writing `plan`.
+ * @param {string} content  model output so far
+ * @returns {object}
+ */
+export function completedFields(content) {
+  const s = String(content ?? '');
+  const out = {};
+  let i = s.indexOf('{');
+  if (i < 0) return out;
+  i++;
+  for (;;) {
+    i = skipSpace(s, i);
+    if (s[i] === ',') i = skipSpace(s, i + 1);
+    if (s[i] !== '"') return out;
+    const keyEnd = scanJsonValue(s, i);
+    if (keyEnd < 0) return out;
+    const key = tryParse(s.slice(i, keyEnd));
+    i = skipSpace(s, keyEnd);
+    if (s[i] !== ':') return out;
+    i = skipSpace(s, i + 1);
+    const end = scanJsonValue(s, i);
+    if (end < 0) return out;
+    const value = tryParse(s.slice(i, end));
+    if (typeof key !== 'string' || value === undefined) return out;
+    out[key] = value;
+    i = end;
+  }
+}
+
+function skipSpace(s, i) {
+  while (i < s.length && /\s/.test(s[i])) i++;
+  return i;
+}
+
+/** End index (exclusive) of the JSON value starting at i, or -1 if it has not fully arrived yet. */
+function scanJsonValue(s, i) {
+  const c = s[i];
+  if (c === '"') {
+    for (let j = i + 1; j < s.length; j++) {
+      if (s[j] === '\\') j++;
+      else if (s[j] === '"') return j + 1;
+    }
+    return -1;
+  }
+  if (c === '{' || c === '[') {
+    let depth = 0;
+    for (let j = i; j < s.length; j++) {
+      const d = s[j];
+      if (d === '"') {
+        j = scanJsonValue(s, j) - 1;
+        if (j < 0) return -1;
+      } else if (d === '{' || d === '[') depth++;
+      else if ((d === '}' || d === ']') && --depth === 0) return j + 1;
+    }
+    return -1;
+  }
+  // a literal (null, true, false, a number) is complete only once a delimiter follows it
+  const m = /^[^\s,}\]]+(?=[\s,}\]])/.exec(s.slice(i));
+  return m ? i + m[0].length : -1;
+}
+
+/**
  * Validate and normalize a raw action.
  * @param {unknown} raw  parsed model output
  * @param {object} [opts]

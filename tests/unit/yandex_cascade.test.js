@@ -7,7 +7,7 @@ import { describe, test } from 'node:test';
 import { VOICE_PROVIDERS, createVoice, selectVoiceProvider } from '../../src/audio/voice.js';
 import { VOICE_PROVIDERS as CONFIG_PROVIDERS, validateSettings } from '../../src/config.js';
 import { createYandexEars, sessionOptions } from '../../src/audio/yandex_ears.js';
-import { TTS_URL, createYandexMouth, toSpeechKitText } from '../../src/audio/yandex_mouth.js';
+import { PREFETCH_TTL_MS, TTS_URL, createYandexMouth, toSpeechKitText } from '../../src/audio/yandex_mouth.js';
 import { ElevenMouth } from '../../src/audio/eleven_mouth.js';
 import { CAPTURE_WORKLET_SRC } from '../../src/browser/worklets.js';
 import { resolveProvider } from '../../src/brain/client.js';
@@ -106,6 +106,66 @@ describe('yandex mouth (SpeechKit TTS v3)', () => {
     assert.equal(r.status, 'cancelled');
     assert.equal(end.status, 'cancelled');
     assert.equal(mouth.stats().cancelled, 1);
+  });
+
+  test('prefetch(): say() of the same line plays the ready audio without a second request', async () => {
+    const calls = [];
+    const mouth = createYandexMouth({ apiKey: 'k', fetch: ttsFetch([chunk(2400), chunk(1200)], { calls }) });
+    assert.equal(mouth.prefetch('  Да, слышу!  '), true);
+    assert.equal(mouth.prefetch('Да, слышу!'), false, 'one synthesis per text');
+    await sleep(10);
+    const got = [];
+    let start = null;
+    const r = await mouth.say('Да, слышу!', { format: 'buffer', onAudio: (b) => got.push(b), onStart: (i) => (start = i) }).done;
+    assert.equal(calls.length, 1);
+    assert.equal(r.status, 'completed');
+    assert.equal(r.audio_ms, 150);
+    assert.equal(got.length, 2);
+    assert.equal(start.prefetched, true);
+    assert.deepEqual(mouth.stats().prefetch, { started: 1, used: 1, unused: 0, failed: 0 });
+    await mouth.say('Да, слышу!').done;
+    assert.equal(calls.length, 2, 'a prefetch serves one say()');
+    assert.equal(mouth.stats().chars, 20);
+  });
+
+  test('prefetch(): a failed prefetch falls back to a fresh request; stale or excess ones are dropped', async () => {
+    let fail = true;
+    const calls = [];
+    const ok = ttsFetch([chunk(240)], { calls });
+    const t = { now: 0 };
+    const mouth = createYandexMouth({ apiKey: 'k', now: () => t.now, fetch: (url, init) => (fail ? ((fail = false), Promise.reject(new Error('reset'))) : ok(url, init)) });
+    mouth.prefetch('Раз.');
+    const r = await mouth.say('Раз.').done;
+    assert.equal(r.status, 'completed');
+    assert.equal(calls.length, 1);
+    assert.equal(mouth.stats().prefetch.failed, 1);
+    mouth.prefetch('Два.');
+    t.now += PREFETCH_TTL_MS + 1;
+    await mouth.say('Два.').done;
+    assert.equal(calls.length, 3, 'an expired prefetch is not used');
+    for (const text of ['А.', 'Б.', 'В.', 'Г.']) mouth.prefetch(text);
+    const st = mouth.stats().prefetch;
+    assert.equal(st.unused, 2, 'the expired one and the oldest of four');
+    await mouth.close();
+    assert.equal(mouth.stats().prefetch.unused, 5);
+    assert.equal(mouth.prefetch('Д.'), false, 'closed');
+  });
+
+  test('prefetch(): cancelling the say() that waits for it cancels the prefetch too', async () => {
+    const signals = [];
+    const fetch = (url, init) => {
+      signals.push(init.signal);
+      return new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true }));
+    };
+    const mouth = createYandexMouth({ apiKey: 'k', fetch });
+    mouth.prefetch('Долгая фраза');
+    const h = mouth.say('Долгая фраза');
+    await sleep(5);
+    await h.cancel();
+    assert.equal((await h.done).status, 'cancelled');
+    assert.equal(signals.length, 1);
+    assert.equal(signals[0].aborted, true);
+    assert.equal(mouth.stats().prefetch.failed, 0);
   });
 });
 

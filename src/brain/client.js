@@ -26,6 +26,10 @@
 //    passed since the previous start.
 // Pass a function instead of a context object to build the context only when the request
 // actually starts: decide(() => buildContext(state.snapshot()), {trigger}).
+// opts.onText({action, to, text}) fires once per attempt as soon as the streamed output has a
+// complete `action` and `text` that pass validation (text already normalized), while the model is
+// still writing `plan`: the host starts synthesizing the line early. The decision itself still
+// comes only from the full, validated output.
 // decide() never rejects: every caller gets a result whose action is safe to apply
 // (a 'wait' for any status but 'ok').
 
@@ -34,7 +38,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { dayMode as clockDayMode } from '../clock.js';
 import { selectBrainProvider } from '../config.js';
 import { hasKey, requireKey } from '../env.js';
-import { ACTION_JSON_SCHEMA, ACTION_SCHEMA_NAME, TEXT_LIMITS, parseActionText, validate, waitAction } from './actions.js';
+import { ACTION_JSON_SCHEMA, ACTION_SCHEMA_NAME, TEXT_LIMITS, completedFields, parseActionText, validate, waitAction } from './actions.js';
 import { estimateTokens } from './context.js';
 import { buildSystemPrompt, humanModelName, loadBrainAssets } from './prompt.js';
 
@@ -205,7 +209,7 @@ export function estimateCost(model, usage) {
  * @param {string} [opts.configDir]  where playbook.md / persona.md / people.json live
  * @param {'monday_focus'|'daily_plans'} [opts.dayMode]  default: clock.dayMode() ('off' -> daily_plans)
  * @param {() => number} [opts.clock]  monotonic ms (default performance.now)
- * @returns {{decide: (context: object|Function, opts?: {signal?: AbortSignal, priority?: 'high'|'normal'|number, trigger?: string}) => Promise<object>,
+ * @returns {{decide: (context: object|Function, opts?: {signal?: AbortSignal, priority?: 'high'|'normal'|number, trigger?: string, onText?: Function}) => Promise<object>,
  *   warmup: (context?: object) => Promise<object>, close: () => void, stats: () => object,
  *   readonly provider: string, readonly model: string, readonly systemPrompt: string}}
  */
@@ -288,7 +292,7 @@ export function createBrain({
     const trigger = opts.trigger ?? (input && typeof input === 'object' ? (input.trigger ?? null) : null);
     const priority = priorityOf(opts.priority, trigger);
     return new Promise((resolve) => {
-      const caller = { resolve, settled: false, trigger, calledAt: clock(), cleanup: null };
+      const caller = { resolve, settled: false, trigger, calledAt: clock(), cleanup: null, onText: typeof opts.onText === 'function' ? opts.onText : null };
       stats.calls++;
       if (closed) return settle(caller, stub('aborted', 'brain_closed', caller));
       const signal = opts.signal;
@@ -441,12 +445,13 @@ export function createBrain({
     let repairTried = false;
     let lengthHit = false;
     let ttft = null;
+    let textMs = null;
     let last = null;
     for (;;) {
       attempts++;
       let r;
       try {
-        r = await requestOnce(messages, job.controller.signal, lengthHit ? 2 : 1);
+        r = await requestOnce(messages, job.controller.signal, lengthHit ? 2 : 1, earlyText(job, participants, (ms) => (textMs ??= Math.round(ms - t0))));
       } catch (e) {
         if (job.controller.signal.aborted) throw job.controller.signal.reason;
         const err = e instanceof BrainError ? e : new BrainError('network', String(e?.message ?? e), { retryable: true });
@@ -475,7 +480,7 @@ export function createBrain({
           }
           continue;
         }
-        return finish(job, t0, queueMs, { status: 'error', action: waitAction(`brain_error:${err.kind}`), error: err, usage, attempts, ttft, last });
+        return finish(job, t0, queueMs, { status: 'error', action: waitAction(`brain_error:${err.kind}`), error: err, usage, attempts, ttft, textMs, last });
       }
       addUsage(usage, r.usage);
       ttft = r.ttft_ms;
@@ -486,7 +491,7 @@ export function createBrain({
         ? validate(parsed.value, { participants, context, limits })
         : { ok: false, errors: [parsed.error + (lengthHit ? ' (output cut by the token limit)' : '')], warnings: [] };
       if (verdict.ok) {
-        return finish(job, t0, queueMs, { status: 'ok', action: verdict.action, warnings: verdict.warnings, usage, attempts, ttft, repaired: repairTried, last });
+        return finish(job, t0, queueMs, { status: 'ok', action: verdict.action, warnings: verdict.warnings, usage, attempts, ttft, textMs, repaired: repairTried, last });
       }
       emit('brain.invalid', { job: job.id, attempt: attempts, errors: verdict.errors, raw: clip(r.content, 600), finish_reason: r.finish_reason });
       if (!repairTried) {
@@ -494,8 +499,33 @@ export function createBrain({
         messages = [...base(), { role: 'assistant', content: r.content || '(пустой ответ)' }, { role: 'user', content: repairPrompt(verdict.errors) }];
         continue;
       }
-      return finish(job, t0, queueMs, { status: 'invalid', action: waitAction('invalid_brain_output'), errors: verdict.errors, usage, attempts, ttft, last });
+      return finish(job, t0, queueMs, { status: 'invalid', action: waitAction('invalid_brain_output'), errors: verdict.errors, usage, attempts, ttft, textMs, last });
     }
+  }
+
+  /**
+   * Stream hook for one attempt: once `action` and `text` are complete and valid, hand the
+   * normalized line to the caller's onText (at most once per attempt). null when nobody listens.
+   */
+  function earlyText(job, participants, onReady) {
+    const onText = job.caller.onText;
+    if (!onText) return null;
+    let fired = false;
+    return (content) => {
+      if (fired || job.caller.settled || !content.includes('"text"')) return;
+      try {
+        const f = completedFields(content);
+        if (!('text' in f) || !('action' in f)) return;
+        fired = true;
+        if (typeof f.text !== 'string' || !f.text.trim()) return;
+        const v = validate({ why: typeof f.why === 'string' ? f.why : '', action: f.action, to: f.to ?? null, text: f.text, plan: null }, { participants, limits });
+        if (!v.ok || !v.action.text) return;
+        onReady(clock());
+        onText({ action: v.action.action, to: v.action.to, text: v.action.text, trigger: job.trigger ?? null, job: job.id });
+      } catch {
+        // an early hint must never break the decision itself
+      }
+    };
   }
 
   function systemMessage() {
@@ -524,6 +554,7 @@ export function createBrain({
       action: p.action,
       latency_ms: Math.round(clock() - t0),
       ttft_ms: p.ttft == null ? null : Math.round(p.ttft),
+      text_ms: p.textMs ?? null,
       queue_ms: queueMs,
       usage,
       provider: active.provider,
@@ -550,6 +581,7 @@ export function createBrain({
       action: result.action,
       latency_ms: result.latency_ms,
       ttft_ms: result.ttft_ms,
+      text_ms: result.text_ms,
       queue_ms: queueMs,
       attempts: result.attempts,
       repaired: result.repaired,
@@ -592,7 +624,7 @@ export function createBrain({
     return body;
   }
 
-  async function requestOnce(messages, jobSignal, tokenFactor) {
+  async function requestOnce(messages, jobSignal, tokenFactor, onContent = null) {
     const body = buildBody(messages, tokenFactor);
     const timeout = new AbortController();
     const timer = setTimeout(
@@ -628,7 +660,7 @@ export function createBrain({
       }
       if (!res.ok) throw await httpError(res);
       const streamed = body.stream && /event-stream/i.test(res.headers.get('content-type') ?? '');
-      const out = streamed ? await readStream(res, started, aborted) : await readJson(res, started, aborted);
+      const out = streamed ? await readStream(res, started, aborted, onContent) : await readJson(res, started, aborted);
       out.request_id ??= res.headers.get('x-request-id');
       out.server_ms = Number(res.headers.get('openai-processing-ms')) || null;
       return out;
@@ -641,7 +673,7 @@ export function createBrain({
     }
   }
 
-  async function readStream(res, started, aborted) {
+  async function readStream(res, started, aborted, onContent = null) {
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -691,6 +723,7 @@ export function createBrain({
             if (typeof delta.content === 'string' && delta.content) {
               if (ttft === null) ttft = clock() - started;
               content += delta.content;
+              onContent?.(content);
             }
             if (typeof delta.refusal === 'string') refusal += delta.refusal;
             if (choice.finish_reason) finishReason = choice.finish_reason;

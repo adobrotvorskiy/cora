@@ -103,7 +103,7 @@ function fakeMouth() {
   };
 }
 
-function makeHost({ present = [], brainScript = null, brainHang = false, flags = {}, voiceConnectError = false, onDemand = false, deps: extraDeps = {} } = {}) {
+function makeHost({ present = [], brainScript = null, brainHang = false, flags = {}, voiceConnectError = false, onDemand = false, prefetch = false, deps: extraDeps = {} } = {}) {
   const t = { now: 1_000_000 };
   const now = () => t.now;
   const events = [];
@@ -115,10 +115,13 @@ function makeHost({ present = [], brainScript = null, brainHang = false, flags =
   const player = fakePlayer(now);
   const ears = new EventEmitter();
   Object.assign(ears, { pushAudio: () => true, close() {}, stats: () => ({}), flush() {} });
+  const mouth = fakeMouth();
+  const prefetched = [];
+  if (prefetch) mouth.prefetch = (text) => (prefetched.push(text), true);
   const voice = {
     kind: 'fake',
     ears,
-    mouth: fakeMouth(),
+    mouth,
     connect: voiceConnectError ? async () => { throw new Error('voice connect boom'); } : async () => ({}),
     close: async () => {},
     stats: () => ({ kind: 'fake' }),
@@ -143,11 +146,12 @@ function makeHost({ present = [], brainScript = null, brainHang = false, flags =
   const brainCalls = [];
   const brain = brainScript || brainHang
     ? {
-        decide: async (ctxFn, { trigger } = {}) => {
+        decide: async (ctxFn, { trigger, onText } = {}) => {
           const ctx = typeof ctxFn === 'function' ? ctxFn() : ctxFn;
           brainCalls.push({ trigger, ctx });
           if (brainHang) return new Promise(() => {}); // a brain that never answers
           const action = brainScript(trigger, ctx) ?? { why: '', action: 'wait', to: null, text: null, plan: null };
+          if (action.text) onText?.({ action: action.action, to: action.to, text: action.text, trigger }); // streamed `text` before `plan`
           return { status: 'ok', action, latency_ms: 1, usage: {} };
         },
         warmup: async () => ({ status: 'ok', latency_ms: 1 }),
@@ -198,6 +202,7 @@ function makeHost({ present = [], brainScript = null, brainHang = false, flags =
     ears,
     events,
     brainCalls,
+    prefetched,
     joins,
     alerts,
     t,
@@ -358,6 +363,28 @@ describe('host: open floor and closing', () => {
 });
 
 describe('host: questions and duplicate answers', () => {
+  test('the brain line is prefetched from the stream (limited like the spoken one), never for clip lines or in shadow', async () => {
+    const long = 'Я тут, всё слышу хорошо. Начнём, когда соберутся все. Пока расскажу, как я устроена, это займёт минуту.';
+    const script = (trigger) => (trigger === 'question_to_host' ? { why: '', action: 'answer', to: null, text: long, plan: null } : null);
+    const h = makeHost({ present: ['Сергей Белозерский'], brainScript: script, prefetch: true });
+    await h.ready();
+    h.ears.emit('stt_final', { item_id: 'p1', text: 'Кора, ты тут?', t: h.t.now, t_speech_start: h.t.now - 900, t_speech_end: h.t.now });
+    await h.settle(300);
+    assert.equal(h.prefetched.length, 1);
+    assert.equal(h.prefetched[0], h.player.plays[0].meta.text, 'the prefetched text is exactly the spoken one');
+    assert.ok(h.prefetched[0].length < long.length, 'limited like applyAction does');
+    assert.equal(h.find('speech.prefetch')[0].trigger, 'question_to_host');
+    await h.finish();
+
+    const shadow = makeHost({ present: ['Сергей Белозерский'], brainScript: script, prefetch: true, flags: { shadow: true } });
+    await shadow.ready();
+    shadow.ears.emit('stt_final', { item_id: 'p2', text: 'Кора, ты тут?', t: shadow.t.now, t_speech_start: shadow.t.now - 900, t_speech_end: shadow.t.now });
+    await shadow.settle(300);
+    assert.equal(shadow.brainCalls.length > 0, true);
+    assert.deepEqual(shadow.prefetched, []);
+    await shadow.finish();
+  });
+
   test('a question without her name in a 1:1 goes to the brain; a second answer to the same question is dropped', async () => {
     const script = (trigger) => (trigger === 'question_to_host' || trigger === 'timer' ? { why: '', action: 'answer', to: 'belozersky_s', text: 'Я Кора, ИИ-ведущая стендапов. Ждём остальных.', plan: null } : null);
     const h = makeHost({ present: ['Сергей Белозерский'], brainScript: script });

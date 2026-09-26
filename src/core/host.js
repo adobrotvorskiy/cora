@@ -593,8 +593,9 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
       return Promise.resolve(null);
     }
     const version = stateVersion;
+    const onText = typeof voice?.mouth?.prefetch === 'function' ? (early) => prefetchLine(early, trigger) : undefined;
     return brain
-      .decide(() => contextFor(trigger), { trigger, priority })
+      .decide(() => contextFor(trigger), { trigger, priority, onText })
       .then((result) => {
         if (done) return result;
         if (result.status !== 'ok') {
@@ -608,6 +609,22 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
         ev('brain.error', { trigger, message: e?.message ?? String(e) });
         return null;
       });
+  }
+
+  /**
+   * The brain's line is out while it still writes `plan`: synthesize it now, so speakOne() plays it
+   * without waiting for TTS. Same text path as applyAction (guards.limitText); a phrases.json line
+   * plays from the clip cache instead. A prefetch nobody says expires in the mouth.
+   */
+  function prefetchLine(early, trigger) {
+    if (done || quiet || flags.shadow || state.phase === 'silent' || state.phase === 'left') return;
+    try {
+      const text = guards.limitText(early.text);
+      if (!text || clips?.has?.(text)) return;
+      if (voice.mouth.prefetch(text)) ev('speech.prefetch', { trigger, action: early.action, text });
+    } catch (e) {
+      ev('speech.error', { where: 'prefetch', message: e?.message ?? String(e) });
+    }
   }
 
   function applyAction(action, trigger, { version } = {}) {

@@ -3,6 +3,8 @@
 // arrives in one chunk ~150–300 ms after the request, so no text-input streaming is needed.
 // Same contract as OrMouth: say(text, {onAudio, onStart, onEnd, format}) -> {id, done, cancel},
 // renderClip(text) -> Buffer (PCM16 mono 24 kHz, the page player's rate), cacheKey, stats().
+// prefetch(text) synthesizes a line ahead (the brain's `text` is out while it still writes `plan`);
+// a say() of the same text within PREFETCH_TTL_MS plays that audio instead of a new request.
 
 import { EventEmitter } from 'node:events';
 import { createHash } from 'node:crypto';
@@ -22,6 +24,9 @@ export function toSpeechKitText(text) {
 }
 /** SpeechKit refuses a single utterance longer than ~250 chars unless unsafe mode splits it. */
 const SAFE_CHARS = 240;
+/** A prefetched line waits this long for its say() (the host may hold it for a quiet room ~8 s). */
+export const PREFETCH_TTL_MS = 20_000;
+const PREFETCH_MAX = 3;
 
 export function createYandexMouth(opts = {}) {
   return new YandexMouth(opts);
@@ -51,7 +56,8 @@ export class YandexMouth extends EventEmitter {
     this._seq = 0;
     this._closed = false;
     this._inflight = new Set();
-    this._stats = { say: 0, clips: 0, completed: 0, cancelled: 0, failed: 0, chars: 0, audio_ms: 0, ttfa: [] };
+    this._prefetched = new Map(); // text -> {at, ctl, parts: Promise<Buffer[]>}
+    this._stats = { say: 0, clips: 0, completed: 0, cancelled: 0, failed: 0, chars: 0, audio_ms: 0, ttfa: [], prefetch: { started: 0, used: 0, unused: 0, failed: 0 } };
   }
 
   get busy() {
@@ -78,20 +84,29 @@ export class YandexMouth extends EventEmitter {
     const ctl = new AbortController();
     let cancelled = false;
     const t0 = this._now();
+    const ahead = this._takePrefetched(clean);
     const run = async () => {
       let first = null;
       let bytes = 0;
+      const feed = (pcm) => {
+        if (cancelled) return;
+        if (first === null) {
+          first = this._now();
+          this._stats.ttfa.push(first - t0);
+          safe(() => onStart?.({ id, ttfa_ms: first - t0, t: first, prefetched: Boolean(ahead) }));
+        }
+        bytes += pcm.length;
+        safe(() => onAudio?.(format === 'buffer' ? pcm : pcm.toString('base64')));
+      };
       try {
-        await this._synthesize(clean, ctl.signal, (pcm) => {
-          if (cancelled) return;
-          if (first === null) {
-            first = this._now();
-            this._stats.ttfa.push(first - t0);
-            safe(() => onStart?.({ id, ttfa_ms: first - t0, t: first }));
-          }
-          bytes += pcm.length;
-          safe(() => onAudio?.(format === 'buffer' ? pcm : pcm.toString('base64')));
-        });
+        const parts = ahead ? await this._awaitPrefetched(ahead, ctl.signal) : null;
+        if (parts) {
+          this._stats.prefetch.used++;
+          for (const pcm of parts) feed(pcm);
+        } else {
+          await this._synthesize(clean, ctl.signal, feed);
+          this._stats.chars += clean.length;
+        }
       } catch (e) {
         if (cancelled) return this._end({ status: 'cancelled', ttfa_ms: first === null ? null : first - t0, audio_ms: msOf(bytes) }, onEnd);
         this._stats.failed++;
@@ -100,7 +115,6 @@ export class YandexMouth extends EventEmitter {
         safe(() => onEnd?.({ status: 'failed', error: err.message }));
         throw err;
       }
-      this._stats.chars += clean.length;
       if (cancelled) return this._end({ status: 'cancelled', ttfa_ms: first === null ? null : first - t0, audio_ms: msOf(bytes) }, onEnd);
       this._stats.audio_ms += msOf(bytes);
       return this._end({ status: 'completed', ttfa_ms: first === null ? null : first - t0, audio_ms: msOf(bytes) }, onEnd);
@@ -114,9 +128,77 @@ export class YandexMouth extends EventEmitter {
       cancel: () => {
         cancelled = true;
         ctl.abort(Object.assign(new Error('cancelled'), { code: 'cancelled' }));
+        ahead?.ctl.abort(Object.assign(new Error('cancelled'), { code: 'cancelled' }));
         return done.catch(() => {});
       },
     };
+  }
+
+  /**
+   * Start synthesizing `text` now; a say() of the same text within PREFETCH_TTL_MS uses it. Idempotent
+   * per text; at most PREFETCH_MAX lines are kept (the oldest is dropped). Never throws.
+   * @returns {boolean} true if a new synthesis started
+   */
+  prefetch(text) {
+    const clean = String(text ?? '').trim();
+    if (!clean || this._closed) return false;
+    this._expirePrefetched();
+    if (this._prefetched.has(clean)) return false;
+    while (this._prefetched.size >= PREFETCH_MAX) this._dropPrefetched(this._prefetched.keys().next().value);
+    const ctl = new AbortController();
+    const parts = [];
+    const entry = { at: this._now(), ctl, parts: null };
+    entry.parts = this._synthesize(clean, ctl.signal, (pcm) => parts.push(pcm)).then(
+      () => {
+        this._stats.chars += clean.length;
+        return parts;
+      },
+      (e) => {
+        if (!ctl.signal.aborted) {
+          this._stats.prefetch.failed++;
+          this._event('mouth.prefetch_error', { chars: clean.length, code: e?.code ?? null, message: String(e?.message ?? e).slice(0, 200) });
+        }
+        return null; // say() falls back to a fresh request
+      },
+    );
+    this._prefetched.set(clean, entry);
+    this._stats.prefetch.started++;
+    return true;
+  }
+
+  _takePrefetched(clean) {
+    this._expirePrefetched();
+    const entry = this._prefetched.get(clean);
+    if (entry) this._prefetched.delete(clean);
+    return entry ?? null;
+  }
+
+  /** The prefetched audio, or null (failed / cancelled) so say() synthesizes afresh. */
+  async _awaitPrefetched(entry, signal) {
+    let onAbort;
+    const aborted = new Promise((_, reject) => {
+      onAbort = () => reject(signal.reason);
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    });
+    try {
+      return await Promise.race([entry.parts, aborted]);
+    } finally {
+      signal.removeEventListener('abort', onAbort);
+    }
+  }
+
+  _expirePrefetched() {
+    const t = this._now();
+    for (const [text, e] of this._prefetched) if (t - e.at > PREFETCH_TTL_MS) this._dropPrefetched(text);
+  }
+
+  _dropPrefetched(text) {
+    const e = this._prefetched.get(text);
+    if (!e) return;
+    this._prefetched.delete(text);
+    this._stats.prefetch.unused++;
+    e.ctl.abort(Object.assign(new Error('prefetch dropped'), { code: 'cancelled' }));
   }
 
   /** One-shot render for the clip cache: Buffer, PCM16 mono 24 kHz. */
@@ -133,6 +215,7 @@ export class YandexMouth extends EventEmitter {
 
   async close() {
     this._closed = true;
+    for (const text of [...this._prefetched.keys()]) this._dropPrefetched(text);
     for (const e of this._inflight) e.ctl.abort(Object.assign(new Error('mouth closed'), { code: 'closed' }));
   }
 
@@ -150,6 +233,7 @@ export class YandexMouth extends EventEmitter {
       chars: this._stats.chars,
       audio_ms: this._stats.audio_ms,
       ttfa_ms: t.length ? { last: t.at(-1), p50: p50(t), max: Math.max(...t), n: t.length } : null,
+      prefetch: { ...this._stats.prefetch },
     };
   }
 

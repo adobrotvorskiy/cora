@@ -106,11 +106,16 @@ async function main() {
       recent_events: [{ t: '10:00:01', type: 'question_to_host', who: 'belozersky_s', how: 'name' }],
       trigger: 'question_to_host',
     });
-    const r = await brain.decide(context, { trigger: 'question_to_host' });
-    console.log(`brain  ${brain.model}: ${r.status} ${r.latency_ms} ms (ttft ${r.ttft_ms ?? '-'}) -> ${r.action?.action ?? '-'} «${r.action?.text ?? ''}»`);
+    // the host prefetches the line once `text` is out of the stream (text_ms), before `plan` ends (latency_ms)
+    const r = await brain.decide(context, { trigger: 'question_to_host', onText: (e) => mouth.prefetch?.(e.text) });
+    console.log(`brain  ${brain.model}: ${r.status} ${r.latency_ms} ms (ttft ${r.ttft_ms ?? '-'}, text ${r.text_ms ?? '-'}) -> ${r.action?.action ?? '-'} «${r.action?.text ?? ''}»`);
     if (r.status !== 'ok') {
       failed = true;
       console.log(`brain  errors: ${JSON.stringify(r.errors ?? r.error ?? null)}`);
+    } else if (r.action?.text) {
+      let ttfa = null;
+      await mouth.say(r.action.text, { format: 'buffer', onStart: (i) => (ttfa = i.ttfa_ms) }).done;
+      console.log(`mouth  reply: first audio ${ttfa} ms after the decision (prefetch ${JSON.stringify(mouth.stats().prefetch)})`);
     }
     brain.close();
   }

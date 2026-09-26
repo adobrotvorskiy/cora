@@ -9,6 +9,7 @@ import { CONFIG_DIR } from '../../src/config.js';
 import {
   ACTIONS,
   ACTION_JSON_SCHEMA,
+  completedFields,
   fixFeminine,
   parseActionText,
   sanitizeText,
@@ -150,6 +151,25 @@ describe('actions: schema, validation, normalization', () => {
     assert.deepEqual(parseActionText(`[${raw}]`).value, GIVE);
     assert.equal(parseActionText('{"action": "wait"').ok, false);
     assert.equal(parseActionText('').ok, false);
+  });
+
+  test('completedFields: only values that fully arrived, as the stream grows', () => {
+    const full = JSON.stringify({ why: 'вопрос "про" меня', action: 'answer', to: null, text: 'Да, слышу. Всё хорошо!', plan: { next: 'nevsky_g', then: ['tkach_t'] } });
+    const at = (needle) => full.slice(0, full.indexOf(needle));
+    assert.deepEqual(completedFields(''), {});
+    assert.deepEqual(completedFields('{"why":"вопрос \\"про'), {});
+    assert.deepEqual(completedFields(at('"action"')), { why: 'вопрос "про" меня' });
+    assert.deepEqual(completedFields(at('"to"')), { why: 'вопрос "про" меня', action: 'answer' });
+    assert.deepEqual(Object.keys(completedFields(at(',"text"'))), ['why', 'action'], 'null is complete only once a delimiter follows it');
+    assert.equal(completedFields(at('"text"')).to, null);
+    assert.equal('text' in completedFields(at('Всё хорошо')), false);
+    const withText = completedFields(at('"plan"'));
+    assert.equal(withText.text, 'Да, слышу. Всё хорошо!');
+    assert.equal('plan' in withText, false);
+    assert.equal('plan' in completedFields(full.slice(0, -3)), false, 'a nested object counts only when closed');
+    assert.deepEqual(completedFields(full).plan, { next: 'nevsky_g', then: ['tkach_t'] });
+    assert.deepEqual(completedFields(`\`\`\`json\n{ "action" : "wait" , "text" : null }`), { action: 'wait', text: null });
+    assert.deepEqual(completedFields('{"text": "a}b", "n": 12'), { text: 'a}b' });
   });
 });
 
@@ -475,6 +495,44 @@ describe('client: one decision', () => {
     await brain.decide({ ...CTX, now: '10:05:09' });
     assert.equal(fetch.calls[1].body.messages[0].content, fetch.calls[0].body.messages[0].content);
     assert.equal(userContext(fetch.calls[1]).now, '10:05:09');
+  });
+
+  test('onText: the normalized line arrives while the stream is still on `plan`, once per decision', async () => {
+    const answer = { why: 'вопрос ко мне', action: 'answer', to: null, text: 'Я понял, отвечаю: да, слышу!', plan: { next: 'nevsky_g', then: [] } };
+    const raw = JSON.stringify(answer);
+    const cut = raw.indexOf('"plan"');
+    const pieces = [raw.slice(0, 20), raw.slice(20, cut), raw.slice(cut, cut + 12), raw.slice(cut + 12)];
+    const fetch = scriptedFetch([
+      () => sse([...pieces.map((p) => ({ choices: [{ delta: { content: p } }] })), { choices: [{ delta: {}, finish_reason: 'stop' }] }, '[DONE]'], { delayMs: 25 }),
+    ]);
+    const { brain, events } = brainWith({ fetch });
+    const early = [];
+    let resolved = false;
+    const r = await brain.decide(CTX, { trigger: 'question_to_host', onText: (e) => early.push({ ...e, resolved }) }).then((x) => ((resolved = true), x));
+    assert.equal(early.length, 1);
+    assert.deepEqual(
+      { action: early[0].action, to: early[0].to, text: early[0].text, trigger: early[0].trigger, resolved: early[0].resolved },
+      { action: 'answer', to: null, text: 'Я поняла, отвечаю: да, слышу!', trigger: 'question_to_host', resolved: false },
+    );
+    assert.equal(r.action.text, early[0].text, 'the early line is exactly the validated one');
+    assert.ok(Number.isFinite(r.text_ms) && r.text_ms <= r.latency_ms - 20, `text ${r.text_ms} ms, total ${r.latency_ms} ms`);
+    assert.equal(events.find((e) => e.type === 'brain.action').text_ms, r.text_ms);
+  });
+
+  test('onText: silent for wait, a null or invalid text, and without a listener', async () => {
+    const cases = [
+      GIVE,
+      { why: '', action: 'wait', to: null, text: 'шепчу', plan: null },
+      { why: '', action: 'speak', to: null, text: 'Hello everyone, this is an English line', plan: null },
+    ];
+    for (const action of cases) {
+      const early = [];
+      const r = await brainWith({ fetch: scriptedFetch([() => sseAction(action)]) }).brain.decide(CTX, { onText: (e) => early.push(e) });
+      assert.equal(early.length, 0, JSON.stringify(action));
+      assert.equal(r.text_ms, null);
+    }
+    const plain = await brainWith({ fetch: scriptedFetch([() => sseAction({ ...GIVE, action: 'speak', to: null, text: 'Всем привет!' })]) }).brain.decide(CTX);
+    assert.equal(plain.text_ms, null);
   });
 
   test('retry once on 5xx', async () => {

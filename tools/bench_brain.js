@@ -146,7 +146,7 @@ async function benchModel({ provider, model, settings, dayMode, contexts, rounds
     }
     for (let round = 0; round < rounds; round++) {
       for (const c of contexts) {
-        const r = await brain.decide(c.context);
+        const r = await brain.decide(c.context, { onText: () => {} }); // onText: report text_ms (when speech could start)
         summary.cost += r.usage.cost_usd ?? 0;
         const verdict = r.status === 'ok' ? c.check(r.action) : { ok: false, note: r.status };
         summary.calls.push({ id: c.id, r, verdict });
@@ -156,7 +156,7 @@ async function benchModel({ provider, model, settings, dayMode, contexts, rounds
           .join(',');
         const served = `${r.response_provider ? `${r.response_provider}, ` : ''}cached ${r.usage.cached_tokens}/${r.usage.prompt_tokens}`;
         console.log(
-          `   ${c.id} ${verdict.ok ? 'OK ' : 'BAD'} ${String(r.latency_ms).padStart(5)} ms ttft ${String(r.ttft_ms ?? '-').padStart(5)} | ${a.action}${a.to ? ` -> ${a.to}` : ''}${a.plan ? ` | plan ${a.plan.next ?? '-'} [${a.plan.then.join(',')}]` : ''}${flags ? ` | ${flags}` : ''} | ${served}`,
+          `   ${c.id} ${verdict.ok ? 'OK ' : 'BAD'} ${String(r.latency_ms).padStart(5)} ms ttft ${String(r.ttft_ms ?? '-').padStart(5)} text ${String(r.text_ms ?? '-').padStart(5)} | ${a.action}${a.to ? ` -> ${a.to}` : ''}${a.plan ? ` | plan ${a.plan.next ?? '-'} [${a.plan.then.join(',')}]` : ''}${flags ? ` | ${flags}` : ''} | ${served}`,
         );
         if (a.text) console.log(`        text: ${a.text}`);
         if (!verdict.ok || verbose) console.log(`        why: ${a.why}${verdict.note ? ` | check: ${verdict.note}` : ''}${r.errors.length ? ` | errors: ${r.errors.join('; ')}` : ''}`);
