@@ -21,6 +21,7 @@ import {
   spokenName,
 } from '../../src/audio/clips.js';
 import { loadSettings } from '../../src/config.js';
+import { createYandexMouth } from '../../src/audio/yandex_mouth.js';
 
 const ID = { provider: 'openrouter', model: 'openai/gpt-audio-mini', voice: 'shimmer', instructions: 'Ты Кора.' };
 
@@ -476,4 +477,20 @@ test('edgeSilenceMs: sustained 10 ms windows, clicks at the edges ignored, cut =
   assert.equal(wav.toString('ascii', 0, 4), 'RIFF');
   assert.equal(wav.readUInt32LE(24), 24000);
   assert.ok(existsSync(tmpdir()));
+});
+
+test('warmup cost with the SpeechKit mouth: per 250-character request, not the OpenAI audio tariff', async () => {
+  const fetch = async () => new Response(`${JSON.stringify({ result: { audioChunk: { data: synth(600).toString('base64') } } })}\n`, { status: 200 });
+  const mouth = createYandexMouth({ apiKey: 'k', fetch, usdRub: 100 });
+  const phrases = { greet: { variants: ['Доброе утро!'], per_person: false }, long: { variants: ['а'.repeat(260)], per_person: false } };
+  const s = new ClipStore({ phrases, people: [], identity: { provider: 'yandex_tts', model: 'speechkit', voice: 'alena', instructions: 'x' }, mouth, cacheDir: tmpCache() });
+  const r = await s.warmup({ keys: ['greet', 'long'], surnames: false });
+  assert.equal(r.rendered, 2);
+  assert.equal(r.cost_source, 'usage.cost');
+  assert.equal(r.cost_usd, Math.round(((1 + 2) * 0.1626) / 100 * 1e6) / 1e6, '1 unit + 2 units (260 chars)');
+  assert.equal(mouth.stats().units, 3);
+  assert.equal(mouth.stats().cost_usd, r.cost_usd);
+  const again = await s.warmup({ keys: ['greet', 'long'], surnames: false });
+  assert.equal(again.rendered, 0);
+  assert.equal(again.cost_usd, 0, 'cached clips cost nothing');
 });

@@ -151,6 +151,7 @@ export function validateSettings(s) {
       const y = isPlainObject(s.yandex) ? s.yandex : {};
       if (typeof y.folder !== 'string' || !y.folder.trim()) errors.push('yandex.folder must be the cloud folder id (settings.local.json) for voice.provider yandex_cascade');
       if (y.tts !== undefined && !isPlainObject(y.tts)) errors.push('yandex.tts must be an object {voice, role, speed}');
+      if (y.tts_pricing !== undefined && !isPlainObject(y.tts_pricing)) errors.push('yandex.tts_pricing must be an object {rub_per_unit, chars_per_unit}');
       if (y.cascade_mouth !== undefined && !['speechkit', 'elevenlabs'].includes(y.cascade_mouth)) errors.push('yandex.cascade_mouth must be speechkit|elevenlabs');
     }
     if (v.eleven !== undefined && !isPlainObject(v.eleven)) errors.push('voice.eleven must be an object');

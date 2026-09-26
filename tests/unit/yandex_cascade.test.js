@@ -126,6 +126,8 @@ describe('yandex mouth (SpeechKit TTS v3)', () => {
     await mouth.say('Да, слышу!').done;
     assert.equal(calls.length, 2, 'a prefetch serves one say()');
     assert.equal(mouth.stats().chars, 20);
+    assert.equal(mouth.stats().units, 2, 'billed per request: the prefetch and the second say');
+    assert.equal(mouth.stats().cost_usd, Math.round(((2 * 0.1626) / 90) * 1e6) / 1e6);
   });
 
   test('prefetch(): a failed prefetch falls back to a fresh request; stale or excess ones are dropped', async () => {

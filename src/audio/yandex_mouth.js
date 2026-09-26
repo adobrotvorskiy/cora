@@ -5,12 +5,20 @@
 // renderClip(text) -> Buffer (PCM16 mono 24 kHz, the page player's rate), cacheKey, stats().
 // prefetch(text) synthesizes a line ahead (the brain's `text` is out while it still writes `plan`);
 // a say() of the same text within PREFETCH_TTL_MS plays that audio instead of a new request.
+// Cost: API v3 bills every request by 250-character units (TTS_PRICING); stats().cost_usd counts
+// all requests (say, prefetch, renderClip), renderClip(text, {withInfo: true}) returns its cost_usd.
 
 import { EventEmitter } from 'node:events';
 import { createHash } from 'node:crypto';
 
 export const TTS_URL = 'https://tts.api.cloud.yandex.net/tts/v3/utteranceSynthesis';
 export const TTS_DEFAULTS = Object.freeze({ voice: 'alena', role: 'good', speed: 1.1 });
+/**
+ * SpeechKit API v3 synthesis price (Yandex Cloud tariff, 2026, VAT incl.): 0.1626 ₽ per request of up to
+ * 250 characters; a longer request counts as ceil(chars / 250). settings.yandex.tts_pricing overrides.
+ */
+export const TTS_PRICING = Object.freeze({ rub_per_unit: 0.1626, chars_per_unit: 250 });
+const USD_RUB = 90; // the host's default settings.cost.usd_rub
 const SAMPLE_RATE = 24000;
 const STRESSED_VOWEL = /([аеёиоуыэюяАЕЁИОУЫЭЮЯ])́/g;
 
@@ -42,8 +50,10 @@ export class YandexMouth extends EventEmitter {
    * @param {Function} [opts.fetch]
    * @param {() => number} [opts.now]
    * @param {number} [opts.timeoutMs]     no first audio within this -> failed
+   * @param {{rub_per_unit?: number, chars_per_unit?: number}} [opts.pricing]  settings.yandex.tts_pricing
+   * @param {number} [opts.usdRub]        settings.cost.usd_rub (costs are reported in USD like other providers)
    */
-  constructor({ apiKey, folderId = null, tts = {}, log = null, fetch = globalThis.fetch, now = Date.now, timeoutMs = 6000 } = {}) {
+  constructor({ apiKey, folderId = null, tts = {}, log = null, fetch = globalThis.fetch, now = Date.now, timeoutMs = 6000, pricing = null, usdRub = USD_RUB } = {}) {
     super();
     if (!apiKey) throw new Error('createYandexMouth: apiKey is required');
     this._key = apiKey; // only this object holds it; nothing dumps `this`
@@ -53,11 +63,13 @@ export class YandexMouth extends EventEmitter {
     this._fetch = fetch;
     this._now = now;
     this._timeoutMs = timeoutMs;
+    this._pricing = { ...TTS_PRICING, ...definedOf(pricing) };
+    this._usdRub = Number(usdRub) > 0 ? Number(usdRub) : USD_RUB;
     this._seq = 0;
     this._closed = false;
     this._inflight = new Set();
     this._prefetched = new Map(); // text -> {at, ctl, parts: Promise<Buffer[]>}
-    this._stats = { say: 0, clips: 0, completed: 0, cancelled: 0, failed: 0, chars: 0, audio_ms: 0, ttfa: [], prefetch: { started: 0, used: 0, unused: 0, failed: 0 } };
+    this._stats = { say: 0, clips: 0, completed: 0, cancelled: 0, failed: 0, chars: 0, units: 0, audio_ms: 0, ttfa: [], prefetch: { started: 0, used: 0, unused: 0, failed: 0 } };
   }
 
   get busy() {
@@ -105,7 +117,7 @@ export class YandexMouth extends EventEmitter {
           for (const pcm of parts) feed(pcm);
         } else {
           await this._synthesize(clean, ctl.signal, feed);
-          this._stats.chars += clean.length;
+          this._billed(clean);
         }
       } catch (e) {
         if (cancelled) return this._end({ status: 'cancelled', ttfa_ms: first === null ? null : first - t0, audio_ms: msOf(bytes) }, onEnd);
@@ -150,7 +162,7 @@ export class YandexMouth extends EventEmitter {
     const entry = { at: this._now(), ctl, parts: null };
     entry.parts = this._synthesize(clean, ctl.signal, (pcm) => parts.push(pcm)).then(
       () => {
-        this._stats.chars += clean.length;
+        this._billed(clean);
         return parts;
       },
       (e) => {
@@ -201,16 +213,30 @@ export class YandexMouth extends EventEmitter {
     e.ctl.abort(Object.assign(new Error('prefetch dropped'), { code: 'cancelled' }));
   }
 
-  /** One-shot render for the clip cache: Buffer, PCM16 mono 24 kHz. */
-  async renderClip(text) {
+  /** One-shot render for the clip cache: Buffer, PCM16 mono 24 kHz; with {withInfo: true} {pcm, audio_ms, cost_usd}. */
+  async renderClip(text, { withInfo = false } = {}) {
     const clean = String(text ?? '').trim();
-    if (!clean) return Buffer.alloc(0);
+    if (!clean) return withInfo ? { pcm: Buffer.alloc(0), audio_ms: 0, cost_usd: 0 } : Buffer.alloc(0);
     if (this._closed) throw Object.assign(new Error('mouth closed'), { code: 'closed' });
     const parts = [];
     await this._synthesize(clean, AbortSignal.timeout(this._timeoutMs * 2), (pcm) => parts.push(pcm));
     this._stats.clips++;
+    const costUsd = this._billed(clean);
+    const pcm = Buffer.concat(parts);
+    return withInfo ? { pcm, audio_ms: msOf(pcm.length), cost_usd: costUsd } : pcm;
+  }
+
+  /** USD cost of synthesizing `text` once (API v3: per started 250-character unit). */
+  costUsd(text) {
+    const units = Math.ceil(String(text ?? '').trim().length / this._pricing.chars_per_unit);
+    return (units * this._pricing.rub_per_unit) / this._usdRub;
+  }
+
+  /** Count one successful synthesis request; returns its USD cost. */
+  _billed(clean) {
     this._stats.chars += clean.length;
-    return Buffer.concat(parts);
+    this._stats.units += Math.ceil(clean.length / this._pricing.chars_per_unit);
+    return this.costUsd(clean);
   }
 
   async close() {
@@ -231,6 +257,8 @@ export class YandexMouth extends EventEmitter {
       cancelled: this._stats.cancelled,
       failed: this._stats.failed,
       chars: this._stats.chars,
+      units: this._stats.units,
+      cost_usd: Math.round(((this._stats.units * this._pricing.rub_per_unit) / this._usdRub) * 1e6) / 1e6,
       audio_ms: this._stats.audio_ms,
       ttfa_ms: t.length ? { last: t.at(-1), p50: p50(t), max: Math.max(...t), n: t.length } : null,
       prefetch: { ...this._stats.prefetch },

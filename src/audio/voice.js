@@ -164,7 +164,7 @@ export function createVoice({ settings = {}, log, keys, env = process.env, fetch
     const mouth =
       selection.mouth === 'elevenlabs'
         ? createElevenMouth({ apiKey: requireKey(settings.keys?.elevenlabs, env), voiceId: settings.voice?.eleven_voice_id, log, ...httpOpts, ...clock, ...mouthOpts })
-        : createYandexMouth({ apiKey, folderId: selection.folder, tts: y.tts, log, ...httpOpts, ...clock, ...mouthOpts });
+        : createYandexMouth({ apiKey, folderId: selection.folder, tts: y.tts, pricing: y.tts_pricing, usdRub: settings.cost?.usd_rub, log, ...httpOpts, ...clock, ...mouthOpts });
     return {
       kind: 'yandex_cascade',
       selection,
@@ -183,7 +183,11 @@ export function createVoice({ settings = {}, log, keys, env = process.env, fetch
         ears.close();
         await mouth.close();
       },
-      stats: () => ({ kind: 'yandex_cascade', ears: ears.stats(), mouth: mouth.stats(), cost_usd: 0 }),
+      stats: () => {
+        const m = mouth.stats();
+        // SpeechKit TTS requests (live lines, prefetches, clip renders); STT is not priced here
+        return { kind: 'yandex_cascade', ears: ears.stats(), mouth: m, cost_usd: typeof m.cost_usd === 'number' ? m.cost_usd : 0 };
+      },
     };
   }
 
