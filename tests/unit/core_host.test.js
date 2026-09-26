@@ -655,6 +655,25 @@ describe('host helpers', () => {
 });
 
 describe('host: on-demand mode (no schedule)', () => {
+  test('--max-minutes: farewell to people in the room, silent exit from an empty one', async () => {
+    const empty = makeHost({ present: [], onDemand: true, flags: { maxMinutes: 0.02 } });
+    await empty.ready();
+    await empty.advance(1500, QUIET);
+    await empty.settle(200);
+    assert.equal(empty.player.plays.length, 0, 'no closing line into an empty room');
+    assert.equal(empty.find('round.closing_skipped')[0]?.why, 'empty_room');
+    assert.equal(empty.find('host.finish')[0].reason, 'closing:max_minutes');
+    assert.equal(await empty.run, 0);
+
+    const h = makeHost({ present: ['Тимур Ткач'], onDemand: true, flags: { maxMinutes: 0.02 } });
+    await h.ready();
+    await h.advance(1500, QUIET);
+    await h.settle(200);
+    assert.equal(h.player.plays[0]?.meta.key, 'closing_daily');
+    assert.equal(h.find('round.closing_skipped').length, 0);
+    await h.finish();
+  });
+
   test('scripted: nothing starts by the clock; «Кора, начинай» opens the standup once', async () => {
     const h = makeHost({ present: ['Ярослав Орлов', 'Тимур Ткач'], onDemand: true });
     await h.ready();

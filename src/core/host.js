@@ -889,6 +889,11 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
 
   function startClosing(reason, text = null) {
     if (done || flow.closingStarted) return;
+    if (!state.presentIds().length) {
+      // nobody to say goodbye to (an on-demand run ending by --max-minutes, a deadline in an empty room)
+      ev('round.closing_skipped', { reason, why: 'empty_room', phase: state.phase });
+      return finish(`closing:${reason}`);
+    }
     flow.closingStarted = true;
     clearTimeout(planRefreshTimer);
     const prevPhase = state.phase;
