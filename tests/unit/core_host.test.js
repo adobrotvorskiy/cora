@@ -730,6 +730,96 @@ describe('host: open floor in a group (the target scenario)', () => {
   });
 });
 
+describe('host: live test 27.09 (run 2) — dialog in a small group', () => {
+  test('a small group: every line goes to the brain; it sees her own lines; from `utterance` only answers are taken', async () => {
+    const script = (trigger, ctx) => {
+      if (trigger !== 'utterance') return null;
+      const last = ctx.transcript_window.at(-1)?.text ?? '';
+      if (/вопрос/.test(last)) return { why: '', action: 'answer', to: null, text: 'Ждала, пока попросят начать.', plan: null };
+      if (/ревью/.test(last)) return { why: '', action: 'speak', to: null, text: 'Отлично, коллеги!', plan: null };
+      return null;
+    };
+    const h = makeHost({ present: ['Тимур Ткач', 'Глеб Невский'], brainScript: script });
+    await h.ready();
+    h.ears.emit('stt_final', { item_id: 'u1', text: 'я тебе вопрос задал', t: h.t.now, t_speech_start: h.t.now - 1500, t_speech_end: h.t.now });
+    await h.settle(300);
+    assert.equal(h.find('host.utterance').length, 1);
+    assert.equal(h.player.plays.at(-1)?.meta.text, 'Ждала, пока попросят начать.');
+    await h.advance(2000, QUIET);
+    h.ears.emit('stt_final', { item_id: 'u2', text: 'сегодня делаю ревью', t: h.t.now, t_speech_start: h.t.now - 1500, t_speech_end: h.t.now });
+    await h.settle(300);
+    const seen = h.brainCalls.at(-1).ctx.transcript_window;
+    assert.ok(seen.some((l) => l.who === 'host' && l.text === 'Ждала, пока попросят начать.'), `her line in the context: ${JSON.stringify(seen)}`);
+    assert.ok(h.find('host.action_ignored').some((e) => e.reason === 'utterance_answers_only'), 'a speak from an utterance is ignored');
+    assert.equal(h.player.plays.length, 1);
+    const utterances = () => h.brainCalls.filter((c) => c.trigger === 'utterance').length;
+    const before = utterances();
+    h.host._test.beginRound('tkach_t');
+    for (const [i, phrase] of ['да у меня всё', 'да'].entries()) {
+      h.ears.emit('stt_final', { item_id: `c${i}`, text: phrase, t: h.t.now, t_speech_start: h.t.now - 800, t_speech_end: h.t.now });
+    }
+    await h.settle(300);
+    assert.equal(utterances(), before, '«у меня всё» / «да» in the round stay with the turn flow');
+    await h.finish();
+
+    const group = makeHost({ present: ['Тимур Ткач', 'Глеб Невский', 'Ярослав Орлов'], brainScript: script });
+    await group.ready();
+    group.ears.emit('stt_final', { item_id: 'u3', text: 'сегодня делаю ревью', t: group.t.now, t_speech_start: group.t.now - 1500, t_speech_end: group.t.now });
+    await group.settle(300);
+    assert.equal(group.find('host.utterance').length, 0, 'a bigger group: only the usual addressing rules');
+    await group.finish();
+  });
+
+  test('a brain line waiting for the floor is dropped by a newer decision or when people spoke after it', async () => {
+    const h = makeHost({ present: ['Тимур Ткач', 'Глеб Невский', 'Ярослав Орлов'] });
+    await h.ready();
+    await h.advance(300, LOUD); // the room is busy: lines wait at the floor gate
+    await h.host._test.applyAction({ why: '', action: 'speak', to: null, text: 'Все высказались. Кто хочет что-то добавить?', plan: null }, 'silence');
+    await h.advance(500, LOUD);
+    await h.host._test.applyAction({ why: '', action: 'answer', to: null, text: 'Да, завтра как обычно.', plan: null }, 'question_to_host');
+    await h.advance(3000, QUIET);
+    assert.deepEqual(h.player.plays.map((p) => p.meta.text), ['Да, завтра как обычно.'], 'the older line never plays after the newer one');
+    assert.ok(h.find('speech.skipped').some((e) => e.reason === 'superseded'));
+
+    await h.advance(300, LOUD);
+    await h.host._test.applyAction({ why: '', action: 'speak', to: null, text: 'Коллеги, кто-то ещё?', plan: null }, 'silence');
+    await h.advance(300, LOUD);
+    h.ears.emit('stt_final', { item_id: 's1', text: 'у меня ещё вопрос про релиз', t: h.t.now, t_speech_start: h.t.now - 1000, t_speech_end: h.t.now });
+    await h.advance(3000, QUIET);
+    assert.ok(h.find('speech.skipped').some((e) => e.reason === 'context_changed'), 'decided before people spoke again');
+    assert.equal(h.player.plays.length, 1);
+    await h.finish();
+  });
+
+  test('an empty room: no brain calls, no lines, and after the round she leaves once everyone is gone', async () => {
+    const script = () => ({ why: '', action: 'answer', to: null, text: 'Привет!', plan: null });
+    const empty = makeHost({ present: [], brainScript: script, onDemand: true });
+    await empty.ready();
+    empty.ears.emit('stt_final', { item_id: 'e1', text: 'Кора, привет', t: empty.t.now, t_speech_start: empty.t.now - 900, t_speech_end: empty.t.now });
+    await empty.settle(300);
+    assert.equal(empty.brainCalls.length, 0);
+    assert.equal(empty.find('brain.skipped').at(-1)?.reason, 'empty_room');
+    await empty.host._test.applyAction({ why: '', action: 'speak', to: null, text: 'Есть кто?', plan: null }, 'silence');
+    await empty.settle(200);
+    assert.equal(empty.player.plays.length, 0);
+    assert.equal(empty.find('speech.skipped').at(-1)?.reason, 'empty_room');
+    await empty.finish();
+
+    const h = makeHost({ present: ['Тимур Ткач', 'Глеб Невский'] });
+    await h.ready();
+    h.host._test.beginRound('tkach_t');
+    await h.settle(100);
+    h.setTiles([]);
+    await h.settle(200);
+    await h.advance(5000, QUIET);
+    assert.equal(h.find('host.finish').length, 0, 'a grace period: people may rejoin');
+    await h.advance(12_000, QUIET);
+    assert.equal(h.find('host.finish')[0]?.reason, 'empty_room');
+    assert.ok(!h.find('speech.start').some((e) => e.t_real > h.find('host.empty_room')[0].t_real), 'nothing said to the empty room');
+    assert.equal(await h.run, 0);
+  });
+});
+
 describe('host: on-demand mode (no schedule)', () => {
   test('--max-minutes: farewell to people in the room, silent exit from an empty one', async () => {
     const empty = makeHost({ present: [], onDemand: true, flags: { maxMinutes: 0.02 } });

@@ -530,6 +530,18 @@ describe('client: one decision', () => {
     assert.equal(events.find((e) => e.type === 'brain.action').text_ms, r.text_ms);
   });
 
+  test('prompt after the live test 27.09: her lines and `utterance` explained, no «X, продолжай» bridges, no invented rules', () => {
+    const prompt = buildSystemPrompt({ ...loadBrainAssets(), dayMode: 'daily_plans', scheduled: false });
+    assert.match(prompt, /who "host" — это ты/);
+    assert.match(prompt, /utterance \(/);
+    assert.match(prompt, /без «[^»]+, продолжай» и других мостиков/);
+    assert.match(prompt, /Не выдумывай правил/);
+    assert.match(prompt, /не повторяй сказанное/);
+    const answers = [...prompt.matchAll(/Ответ: (\{.*\})/g)].map((m) => JSON.parse(m[1]));
+    assert.ok(answers.length > 3);
+    assert.ok(answers.every((a) => a.action !== 'answer' || !/продолжай/i.test(a.text ?? '')), 'no example answer ends with «продолжай»');
+  });
+
   test('why_last: schema, prompt, examples and repair put `why` after `text`; the line is out before `plan` and `why`', async () => {
     const whyLast = { action: 'answer', to: null, text: 'Да, слышу!', plan: null, why: 'вопрос ко мне' };
     const raw = JSON.stringify(whyLast);

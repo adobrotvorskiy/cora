@@ -132,6 +132,7 @@ export function createFloor({ settings = {}, log = null, now = Date.now } = {}) 
   let activeSince = null;
   let quietFired = false;
   let hostSpeaking = false;
+  let hostEndedAt = -Infinity; // her own speech is not the speaker's pause
   let hostSince = null;
   let loudRunStart = null;
   let bargeFired = false;
@@ -304,6 +305,7 @@ export function createFloor({ settings = {}, log = null, now = Date.now } = {}) 
 
   function setHostSpeaking(on, { t } = {}) {
     const at = t ?? now();
+    if (hostSpeaking && !on) hostEndedAt = at;
     hostSpeaking = Boolean(on);
     hostSince = hostSpeaking ? at : null;
     loudRunStart = null;
@@ -441,7 +443,8 @@ export function createFloor({ settings = {}, log = null, now = Date.now } = {}) 
       return;
     }
     if (turn.fired) return;
-    if (!vadOpen && sil >= cfg.check_done_ms) return fire('silence_2500', at);
+    // live 27.09: «Лёша, у тебя всё?» the moment her answer ended — the silence counted her own speech
+    if (!vadOpen && sil >= cfg.check_done_ms && at - hostEndedAt >= cfg.check_done_ms) return fire('silence_2500', at);
     return undefined;
   }
 

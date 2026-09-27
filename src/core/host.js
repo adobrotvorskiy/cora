@@ -40,7 +40,7 @@ import { sendAlert } from '../ops/telegram.js';
 import { createAttribution } from './attribution.js';
 import { loadClips, loadPlayer, loadVoice, NO_VOICE_KIND } from './deps.js';
 import { AsyncQueue, RingLog, Serializer, Transcript } from './events.js';
-import { createFloor } from './floor.js';
+import { classifyCheckDoneAnswer, createFloor, detectCloser } from './floor.js';
 import { START_RE, createGuards, realRoomAllowed } from './guards.js';
 import { createState, loadRoster } from './state.js';
 
@@ -67,6 +67,8 @@ const RECENT_SAID_MS = 10_000;
 const SPEAK_REPEAT_MS = 30_000; // live 27.09: the brain re-asked «кто хочет добавить?» 14 s after the open-floor clip
 const RECENT_SAID_KEEP_MS = 60_000;
 const OWN_UTTERANCE_WINDOW_MS = 8000;
+const SMALL_GROUP_MAX = 2; // people in the room (without her) up to which every line goes to the brain
+const EMPTY_ROOM_LEAVE_MS = 15_000; // after the round started: everyone left this long ago -> she leaves silently
 const START_REPLY_WINDOW_MS = 12_000; // «давай начнём» without her name, this soon after her own line, is a reply to her
 const BRAIN_ON_BARGE_KINDS = new Set(['answer', 'speak', 'greeting', 'proposal']);
 const COST = Object.freeze({ usd_rub: 90, realtime_audio_in_per_m: 32, realtime_audio_out_per_m: 64, realtime_text_in_per_m: 4, realtime_text_out_per_m: 16, transcribe_per_min: 0.006 });
@@ -275,6 +277,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     turnEnd: null, // {at, prev, to, reason, phase} while a turn-end playback (ack/handoff/open floor) is in flight
     maxMinutesFired: false,
     startRequestedAt: null, // on-demand mode: «Кора, начинай» final that opened the standup
+    emptySince: null, // after the round started: when the last person left
     lastSpokenAt: null,
     recentSaid: [], // {text, at}
     openQuestion: null, // {text, at, answered}
@@ -285,6 +288,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
   };
   const speechQueue = [];
   let currentSpeech = null;
+  let gateSpec = null; // the line speakOne() holds at the floor gate (not playing yet)
   let speechPumpRunning = false;
   let quiet = false; // «Кора, стоп»: no speech out, still listening; lifted by a line addressed to her by name
   const usage = { alerts: 0 };
@@ -354,13 +358,29 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     return { id: cur.id, conf: cur.conf, since: cur.since ? cur.since : null, silence_ms: Number.isFinite(sil) ? sil : 60_000 };
   }
 
+  /** Few people in the room: every line may be for her, the brain decides (live 27.09: «я тебе вопрос задал» went unheard). */
+  function smallGroup() {
+    const n = state.presentIds().length;
+    return n > 0 && n <= (settings.engagement?.small_group_max ?? SMALL_GROUP_MAX);
+  }
+
+  /** «у меня всё», «да» to «всё?» in the round: the turn flow answers them with its own clips, not the brain. */
+  function turnControl(text) {
+    return state.phase === 'round' && Boolean(state.current) && (detectCloser(text) !== null || classifyCheckDoneAnswer(text) !== null);
+  }
+
+  /** Her own line in the transcript the brain sees (who 'host'; cut = a barge-in stopped it). */
+  function transcriptOwnLine(text) {
+    return transcript.push({ t: wall(), t_meeting: nowMs(), t_msk: clock.formatMsk(new Date(nowMs()), 'HH:mm:ss'), who: 'host', conf: 'self', text, cut: false });
+  }
+
   function contextFor(trigger) {
     const snap = state.snapshot({
       trigger,
       speaker: speakerContext(),
       host: { ...hostState, speaking: hostState.speaking || player?.isSpeaking?.() === true },
       recent_events: recent.recent(20),
-      transcript_window: transcript.window(45_000, wall()).map((l) => ({ t: l.t_msk, who: l.who, text: l.text })),
+      transcript_window: transcript.window(45_000, wall()).map((l) => ({ t: l.t_msk, who: l.who, text: l.text, ...(l.cut ? { cut: true } : {}) })),
     });
     return buildContext(snap, { windowSec: 45, maxEvents: 20, maxTokens: 2500, leadId: state.firstAlways });
   }
@@ -459,6 +479,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
         hostState.last_utterance = text;
         flow.lastSpokenAt = wall();
         flow.recentSaid.push({ text, at: wall(), completed: true });
+        transcriptOwnLine(text);
         return { status: 'shadow', text, played_ratio: 1 };
       }
       return { status: 'suppressed', reason: allowed.reason, text, played_ratio: 0 };
@@ -470,7 +491,22 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     // must not keep the answer back; after that long she speaks anyway
     const forceAt = Number.isFinite(spec.forceAfterMs) ? t0 + spec.forceAfterMs : null;
     const forcedNow = () => forceAt !== null && wall() >= forceAt;
-    while (!floor.canSpeak(wall()) && wall() - t0 < maxWait && !done && !spec.force && !forcedNow()) await sleep(TICK_MS);
+    gateSpec = spec;
+    try {
+      while (!floor.canSpeak(wall()) && wall() - t0 < maxWait && !done && !spec.force && !forcedNow() && !staleLine(spec)) await sleep(TICK_MS);
+    } finally {
+      gateSpec = null;
+    }
+    const stale = staleLine(spec);
+    if (stale) {
+      // live 27.09: a line decided before a newer decision (or before people spoke again) played after it
+      ev('speech.skipped', { reason: stale, waited_ms: wall() - t0, kind: spec.kind ?? null, text });
+      return { status: 'skipped', reason: stale, text, played_ratio: 0 };
+    }
+    if (!spec.force && !state.presentIds().length) {
+      ev('speech.skipped', { reason: 'empty_room', key: spec.key ?? null, kind: spec.kind ?? null, text });
+      return { status: 'skipped', reason: 'empty_room', text, played_ratio: 0 };
+    }
     const forced = !floor.canSpeak(wall()) && !spec.force && forcedNow();
     if (forced) ev('speech.forced', { waited_ms: wall() - t0, kind: spec.kind ?? null, text, silence_ms: floor.silenceMs(wall()) });
     if (!floor.canSpeak(wall()) && !spec.force && !forced) {
@@ -496,6 +532,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     floor.setHostSpeaking(true, { t: wall() });
     const said = { text, at: wall(), completed: false };
     flow.recentSaid.push(said);
+    const ownLine = transcriptOwnLine(text);
     const meta = { key: spec.key ?? null, person: spec.person ?? null, kind: spec.kind ?? (spec.key ? 'clip' : 'live'), text, wait_ms: waitMs, ...(spec.meta ?? {}) };
     ev('speech.start', { source: clip ? 'clip' : 'live', key: spec.key ?? null, person: spec.person ?? null, kind: meta.kind, text, wait_ms: waitMs, duration_ms: clip?.duration_ms ?? null });
     let result;
@@ -517,6 +554,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     hostState.last_utterance = text;
     hostState.last_interrupted = result.status === 'aborted';
     said.completed = result.status === 'completed';
+    ownLine.cut = result.status === 'aborted';
     if (result.status === 'completed') flow.lastSpokenAt = wall();
     ev(result.status === 'aborted' ? 'speech.abort' : 'speech.end', {
       status: result.status,
@@ -593,10 +631,33 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     }
   }
 
+  /** Why a queued brain line is no longer worth saying, or null. */
+  function staleLine(spec) {
+    if (spec.superseded) return 'superseded';
+    // a brain `speak` decided before someone spoke again answers a room that has moved on
+    if (spec.brain && spec.kind === 'speak' && transcript.lines.some((l) => l.who !== 'host' && l.t > spec.decidedAt)) return 'context_changed';
+    return null;
+  }
+
+  /** A newer brain line replaces the older ones still waiting (queued or held at the floor gate); a `speak` never drops an answer. */
+  function supersedeBrainLines(kinds = ['speak', 'answer']) {
+    const hit = (spec) => spec?.brain && kinds.includes(spec.kind);
+    const stale = speechQueue.filter((i) => hit(i.spec));
+    if (stale.length) {
+      for (const i of stale) speechQueue.splice(speechQueue.indexOf(i), 1);
+      ev('speech.dropped', { reason: 'superseded', count: stale.length, texts: stale.map((i) => i.spec.text) });
+    }
+    if (hit(gateSpec)) gateSpec.superseded = true;
+  }
+
   // ------------------------------------------------------------------------------------- brain
 
   function think(trigger, { priority } = {}) {
     if (!brain) return Promise.resolve(null);
+    if (!state.presentIds().length) {
+      ev('brain.skipped', { trigger, reason: 'empty_room' });
+      return Promise.resolve(null);
+    }
     const allowed = guards.brainAllowed({ trigger, hostSpeaking: hostState.speaking, costUsd: brain.stats().cost_usd, phase: state.phase });
     if (!allowed.ok) {
       ev('brain.skipped', { trigger, reason: allowed.reason });
@@ -644,6 +705,12 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     if (action.plan) state.setPlan(action.plan);
     if (trigger === 'plan_refresh') return; // only the plan is taken (never interrupt a monologue)
     if (state.phase === 'silent' || state.phase === 'left') return;
+    if (trigger === 'utterance') {
+      // every line of a small group goes to the brain: from it she only answers (or opens / closes the standup);
+      // the turn flow (check_done, handoffs, open floor) stays with the host
+      const ok = action.action === 'answer' || action.action === 'wait' || (action.action === 'give_word' && !flow.roundStarted) || (action.action === 'leave' && state.phase === 'open_floor');
+      if (!ok) return ev('host.action_ignored', { action: action.action, reason: 'utterance_answers_only', text: action.text ?? null });
+    }
     const turnActive = state.phase === 'round' && state.current && floor.turn && !floor.turn.fired && !flow.turnEnd;
     const talkingKinds = new Set(['speak', 'answer']);
     const busyTalking = (currentSpeech && talkingKinds.has(currentSpeech.spec.kind)) || queuedKinds().some((k) => talkingKinds.has(k));
@@ -658,7 +725,8 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
         const text = guards.limitText(action.text);
         if (busyTalking && trigger !== 'question_to_host') return ev('host.action_ignored', { action: 'speak', reason: 'already_speaking', text });
         if (recentlySaid(text, SPEAK_REPEAT_MS)) return ev('host.action_ignored', { action: 'speak', reason: 'duplicate', text });
-        say({ text, kind: 'speak', meta: { trigger } });
+        supersedeBrainLines(['speak']);
+        say({ text, kind: 'speak', meta: { trigger }, brain: true, decidedAt: wall() });
         return;
       }
       case 'answer': {
@@ -671,8 +739,9 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
         if (recentlySaid(text)) return ev('host.action_ignored', { action: 'answer', reason: 'duplicate', text });
         if (q) q.answered = true;
         flow.lastAnswerAt = wall();
+        supersedeBrainLines();
         // the floor stays with whoever held it before the question (model quirk guard)
-        say({ text, kind: 'answer', meta: { trigger }, ...(cascade && q?.how === 'name' ? { forceAfterMs: ADDRESSED_FORCE_MS } : {}) }, () => {
+        say({ text, kind: 'answer', meta: { trigger }, brain: true, decidedAt: wall(), ...(cascade && q?.how === 'name' ? { forceAfterMs: ADDRESSED_FORCE_MS } : {}) }, () => {
           if (state.current) {
             attribution.setPresumed(state.current);
             floor.resumeTurn();
@@ -1254,6 +1323,12 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
         note('question_to_host', { who: line.who, text: text.slice(0, 160), how });
         ev('host.question', { who: line.who, how, text });
         void think('question_to_host', { priority: 'high' });
+      } else if (brain && smallGroup() && state.phase !== 'closing' && !turnControl(text)) {
+        // «я тебе вопрос задал», «хотел у тебя спросить…»: no name, no «?» from STT; the brain sees the whole
+        // dialog and answers or waits (applyAction takes only answers from this trigger)
+        flow.openQuestion = { text, at: wall(), answered: false, how: 'utterance' };
+        ev('host.utterance', { who: line.who, text });
+        void think('utterance', { priority: 'high' });
       }
     });
   }
@@ -1376,6 +1451,22 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     if (sil >= OPEN_FLOOR_AFTER_SPEECH_SILENCE_MS) startClosing('open_floor_silence_after_speech');
   }
 
+  /** Everyone left after the round started: no lines to an empty room, she leaves (live 27.09: three answers to nobody). */
+  function emptyRoomTick(t) {
+    if (!flow.roundStarted || state.phase === 'left') return;
+    if (state.presentIds().length) {
+      flow.emptySince = null;
+      return;
+    }
+    if (flow.emptySince === null) {
+      flow.emptySince = t;
+      clearSpeechQueue('empty_room');
+      ev('host.empty_room', { phase: state.phase });
+      return;
+    }
+    if (t - flow.emptySince >= EMPTY_ROOM_LEAVE_MS) finish('empty_room');
+  }
+
   function tick() {
     if (done) return;
     const t = wall();
@@ -1398,6 +1489,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
         }
       }
       openFloorTick(t);
+      emptyRoomTick(t);
       if (runDeadline !== null && t >= runDeadline && !flow.maxMinutesFired) {
         flow.maxMinutesFired = true;
         ev('guard.max_minutes', { minutes: flags.maxMinutes, phase: state.phase });

@@ -67,7 +67,7 @@ export function buildContext(state = {}, opts = {}) {
       const t = secOfDay(e.t);
       return nowSec === null || t === null || nowSec - t <= o.windowSec;
     })
-    .map((e) => ({ t: fmtTime(e.t), who: e.who == null ? '?' : String(e.who), text: clipTail(e.text.trim(), o.maxTextChars) }));
+    .map((e) => ({ t: fmtTime(e.t), who: e.who == null ? '?' : String(e.who), text: clipTail(e.text.trim(), o.maxTextChars), ...(e.cut ? { cut: true } : {}) }));
 
   const ctx = {
     now: fmtTime(nowValue),

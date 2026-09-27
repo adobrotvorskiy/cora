@@ -156,6 +156,22 @@ describe('floor: turn end', () => {
     assert.equal(s.events.filter((e) => e.type === 'no_speech').length, 1);
   });
 
+  test('her own speech is not the speaker\'s pause: «всё?» comes 2.5 s after she stops, not as she stops', () => {
+    const s = sim();
+    s.floor.newTurn({ speaker: 'tkach_t', t: 0 });
+    s.step(2000, LOUD); // the speaker talks
+    s.floor.setHostSpeaking(true, { t: s.now() }); // she answers a question for 4 s
+    s.step(4000, QUIET);
+    s.floor.setHostSpeaking(false, { t: s.now() });
+    s.floor.resumeTurn();
+    s.step(1000, QUIET);
+    assert.equal(s.events.filter((e) => e.type === 'turn_end_candidate').length, 0, 'the speaker gets time to go on');
+    s.step(2000, QUIET);
+    const c = s.events.find((e) => e.type === 'turn_end_candidate');
+    assert.equal(c?.reason, 'silence_2500');
+    assert.ok(c.t >= 6000 + 2500, `fired at ${c.t}`);
+  });
+
   test('resumeTurn re-arms after a rejected candidate', () => {
     const s = sim();
     s.floor.newTurn({ speaker: 'a', t: 0 });
