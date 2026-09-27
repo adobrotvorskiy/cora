@@ -124,5 +124,8 @@ Node-процесс заходит в Телемост через Chrome (`playw
   { "voice": { "provider": "yandex_cascade" }, "yandex": { "folder": "<id каталога Yandex Cloud, к которому привязан ключ>" } }
   ```
   Без этого файла по умолчанию провайдер `openrouter` из `config/settings.json`.
+- **Пробы для перехода на агента** (27.09, запускает владелец, из облака Яндекс недоступен):
+  - `node tools/probe_agent_tools.js` — умеет ли AI Studio вызывать инструменты для модели мозга (со стримом, несколько вызовов за раз, когда приходит имя инструмента). Людей не нужно;
+  - `node tools/probe_speaker_meta.js --url <тест-комната> --minutes 3` — передаёт ли Телемост автора реплики: сигнальный канал (WebSocket и DataChannel, с сети и из страницы), SSRC/CSRC у аудиоприёмников, расширения RTP в SDP. Нужны двое, говорить по очереди по ~10 с. Лог: `logs/probe_speaker_*.jsonl`, в нём имена, он остаётся локально.
 - **Проверка:** `npm run check`. Каскад без комнаты: `node tools/yandex_cascade_probe.js`. Тест-комната: `node tools/run_testroom.js --provider yandex_cascade --max-minutes N`. В боевую комнату бот заходит только с `--live`.
 - **Логи** каждого запуска: `logs/*.jsonl` (события, транскрипт с полями `who`/`via`/`track`, решения мозга). Для разбора звонка смотри события `transcript`, `speech.*`, `brain.action`, `floor.*`, `page.speaker`.
