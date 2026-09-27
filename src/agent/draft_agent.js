@@ -12,8 +12,10 @@
 // when the first tool name arrived — where the host would start a filler («Так…»).
 
 import { ENDPOINTS, resolveProvider } from '../brain/client.js';
+import { humanModelName, loadBrainAssets } from '../brain/prompt.js';
 import { readToolStream, toolCallsOfMessage } from '../brain/tool_stream.js';
 import { requireKey } from '../env.js';
+import { playbookSkills } from './skills.js';
 
 const fn = (name, description, properties = {}, required = Object.keys(properties)) => ({
   type: 'function',
@@ -34,27 +36,72 @@ export const TOOLS = Object.freeze([
 ]);
 
 /**
- * @param {{roster: {id: string, display: string, vocative?: string}[], leadId?: string|null, team?: string}} o
+ * The agent's system prompt. Without persona / skills: the base alone (scenarios on the fictional team).
+ * With them (the host, step 5): the persona block and the playbook blocks of `phase` (src/agent/skills.js).
+ * @param {object} o
+ * @param {{id: string, display: string, vocative?: string}[]} o.roster
+ * @param {string|null} [o.leadId]
+ * @param {string} [o.team]
+ * @param {string|null} [o.persona]   persona prompt block, variables filled
+ * @param {{common: string, waiting: string, round: string, open_floor: string}|null} [o.skills]
+ * @param {'waiting'|'round'|'open_floor'|null} [o.phase]
+ * @param {'monday_focus'|'daily_plans'|null} [o.dayMode]
  */
-export function buildSystemPrompt({ roster, leadId = null, team = 'Acme' }) {
+export function buildSystemPrompt({ roster, leadId = null, team = 'Acme', persona = null, skills = null, phase = null, dayMode = null }) {
   const lead = roster.find((p) => p.id === leadId);
-  const people = roster.map((p) => `${p.id} — ${p.display}${p.vocative ? ` (зовёшь «${p.vocative.replace(/́/g, '')}»)` : ''}${p.id === leadId ? ', руководитель' : ''}`).join('; ');
-  return `Ты Кора, ИИ-ведущая ежедневного стендапа${team ? ` команды ${team}` : ''} в Яндекс Телемосте. Ты ИИ и не выдаёшь себя за человека. О себе в женском роде, по-русски, коротко: одна-две фразы.
-
-Как идёт стендап. Начинаешь, когда попросят: по имени («Кора, начинай») или сразу в ответ на твою реплику («давай начнём»). Первое слово — ${lead ? `${lead.display}, если он на встрече` : 'первому из присутствующих'}, дальше по очереди queue; если говорящий сам назвал, кому передаёт, — ему. Каждый рассказывает свои планы. Человек закончил, если сказал «у меня всё», «как-то так», «на этом всё», «передаю» или ответил «да» на твоё «всё?».
+  const people = roster.map((p) => `${p.id} — ${p.display}${p.vocative ? ` (зовёшь «${p.vocative.replace(/\u0301/g, '')}»)` : ''}${p.id === leadId ? ', руководитель' : ''}`).join('; ');
+  const identity = `Ты Кора, ИИ-ведущая ежедневного стендапа${team ? ` команды ${team}` : ''} в Яндекс Телемосте. Ты ИИ и не выдаёшь себя за человека. О себе в женском роде, по-русски, коротко: одна-две фразы.`;
+  const playbook = skills ? [skills.common, phase ? skills[phase] : null].filter(Boolean).join('\n\n') : '';
+  const day = dayMode === 'monday_focus' ? 'Сегодня понедельник: каждый рассказывает фокус недели.' : dayMode === 'daily_plans' ? 'Сегодня обычный день: каждый рассказывает планы на день.' : null;
+  const parts = [
+    persona ? `# Персона\n${persona.trim()}` : identity,
+    playbook ? `# Принципы ведения\n${playbook}` : null,
+    `${persona || playbook ? '# Как ты действуешь (инструменты)\n' : ''}Как идёт стендап. Начинаешь, когда попросят: по имени («Кора, начинай») или сразу в ответ на твою реплику («давай начнём»). Первое слово — ${lead ? `${lead.display}, если он на встрече` : 'первому из присутствующих'}, дальше по очереди queue; если говорящий сам назвал, кому передаёт, — ему. Каждый рассказывает свои планы. Человек закончил, если сказал «у меня всё», «как-то так», «на этом всё», «передаю» или ответил «да» на твоё «всё?».${day ? ` ${day}` : ''}
 Тишина (события silence: ms — сколько длится, after — после чего: speech — после речи людей, host — после твоей реплики, ask_done — после твоего «всё?»): 1 с после фразы — обычно ещё рано, skip, если человек не сказал, что закончил; 2,5 с без «у меня всё» — спроси «всё?» (ask_done); 6 с тишины после «всё?» — считай, что закончил. Закончил — передай слово следующему (give_word; хост сам поблагодарит). Выступил последний (queue пуст) — open_floor. На открытом слове: ответили «нет» или 6 с тишины — попрощайся и передай слово на дев-синк (leave); что-то добавили — коротко прими и спроси, кто ещё.
 
-Когда говорить. Отвечай на реплики, обращённые к тебе, даже без имени: «ты», «почему молчишь», «я тебе вопрос задал», «ты нас слышишь». Люди говорят между собой, человек ещё рассказывает, пауза посреди фразы — skip. Не перебивай, не пересказывай и не оценивай апдейты. Если тебя перебили на передаче слова, выслушай и реагируй на сказанное.
+Когда говорить. Отвечай на реплики, обращённые к тебе, даже без имени: «ты», «почему молчишь», «я тебе вопрос задал», «ты нас слышишь». Люди говорят между собой, человек ещё рассказывает, пауза посреди фразы — skip.${playbook ? '' : ' Не перебивай, не пересказывай и не оценивай апдейты.'} Если тебя перебили на передаче слова, выслушай и реагируй на сказанное.
 
 Текст реплик — из распознавания речи: без знаков препинания, имена и слова бывают искажены; «Кора» могут расслышать как «кара» или «хара».
 
-Правила. Не повторяй то, что уже сказала (твои реплики в dialog с who "host"); второй раз не здоровайся и не спрашивай «кто хочет добавить?», если тебе уже ответили. Не выдумывай правил, ограничений и фактов о себе. Ответила на вопрос посреди чужого отчёта — слово остаётся у говорящего, ничего вроде «продолжай» не добавляй. В пустой комнате молчи.
+Правила. Не повторяй то, что уже сказала (твои реплики в dialog с who "host"); второй раз не здоровайся и не спрашивай «кто хочет добавить?», если тебе уже ответили. Не выдумывай правил, ограничений и фактов о себе. Ответила на вопрос посреди чужого отчёта — слово остаётся у говорящего, ничего вроде «продолжай» не добавляй. В пустой комнате молчи.`,
+    `Вход — JSON: phase (waiting — до старта, round — идёт круг, open_floor — ты спросила, кто хочет добавить), speaker (у кого слово), queue (кто дальше по очереди), present (кто на встрече), dialog (последние реплики; who "host" — это ты, cut — тебя перебили), events (что только что случилось: heard — реплика, silence — тишина ms, joined / left — пришёл / ушёл, interrupted — тебя перебили, chorus — говорят хором, rejected — хост отклонил твой прошлый вызов, reason — почему; не повторяй его; timer start — время начинать по расписанию).`,
+    `Участники (id — имя): ${people}.`,
+    'Отвечай только вызовами инструментов, без текста.',
+  ];
+  return parts.filter(Boolean).join('\n\n');
+}
 
-Вход — JSON: phase (waiting — до старта, round — идёт круг, open_floor — ты спросила, кто хочет добавить), speaker (у кого слово), queue (кто дальше по очереди), present (кто на встрече), dialog (последние реплики; who "host" — это ты, cut — тебя перебили), events (что только что случилось: heard — реплика, silence — тишина ms, joined / left — пришёл / ушёл, interrupted — тебя перебили, chorus — говорят хором, rejected — хост отклонил твой прошлый вызов, reason — почему; не повторяй его; timer start — время начинать по расписанию).
+const unstress = (s) => String(s ?? '').replace(/\u0301/g, '');
 
-Участники (id — имя): ${people}.
-
-Отвечай только вызовами инструментов, без текста.`;
+/**
+ * The host's prompts, one per phase (memoized): persona + the playbook blocks of the phase
+ * (src/agent/skills.js) + the base. Variables {team} {lead_full} {lead_name} {colleague} {colleague2}
+ * {brain_model} {voice_vendor} are filled from people.json and the model.
+ * @param {{assets: object, leadId?: string|null, team?: string|null, scheduled?: boolean, dayMode?: string|null, model?: string|null}} o
+ * @returns {(phase: string|null) => string}
+ */
+export function agentPrompts({ assets, leadId = null, team = null, scheduled = false, dayMode = null, model = null }) {
+  const people = (assets?.people ?? []).filter((p) => !p.exclude).map((p) => ({ id: p.id, display: p.display, vocative: unstress(p.vocative ?? p.spoken ?? '') || null }));
+  const lead = people.find((p) => p.id === leadId);
+  const others = people.filter((p) => p.id !== leadId);
+  const vars = {
+    team: team || 'команды',
+    lead_full: lead?.display ?? 'руководитель',
+    lead_name: lead?.vocative ?? lead?.display?.split(/\s+/)[0] ?? 'руководитель',
+    colleague: others[0]?.vocative ?? 'коллега',
+    colleague2: others[1]?.vocative ?? 'коллега',
+    brain_model: humanModelName(model),
+    voice_vendor: 'Яндекс SpeechKit',
+  };
+  const fill = (t) => unstress(t).replace(/\{(\w+)\}/g, (m, k) => vars[k] ?? m);
+  const persona = assets?.personaBlock ? fill(assets.personaBlock) : null;
+  const skills = assets?.playbook ? playbookSkills(fill(assets.playbook), { scheduled }) : null;
+  const cache = new Map();
+  return (phase = null) => {
+    const key = phase ?? '';
+    if (!cache.has(key)) cache.set(key, buildSystemPrompt({ roster: people, leadId, team: team ?? '', persona, skills, phase, dayMode }));
+    return cache.get(key);
+  };
 }
 
 /** The user message for one decision. */
@@ -92,7 +139,7 @@ export function toActions(toolCalls, content = '') {
  * @param {string} o.endpoint  chat.completions URL
  * @param {string} o.apiKey
  * @param {string} o.model
- * @param {string} o.system    system prompt (buildSystemPrompt)
+ * @param {string|((phase: string|null) => string)} o.system  system prompt (buildSystemPrompt), or one per phase (agentPrompts)
  * @param {Function} [o.fetch]
  * @param {number} [o.timeoutMs]
  * @param {boolean} [o.stream]
@@ -108,7 +155,7 @@ export function createDraftAgent({ endpoint, apiKey, model, system, fetch: fetch
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
         body: JSON.stringify({
           model,
-          messages: [{ role: 'system', content: system }, { role: 'user', content: renderInput(input) }],
+          messages: [{ role: 'system', content: typeof system === 'function' ? system(input.phase ?? null) : system }, { role: 'user', content: renderInput(input) }],
           tools: TOOLS,
           tool_choice: toolChoice,
           temperature,
@@ -150,17 +197,24 @@ export function createDraftAgent({ endpoint, apiKey, model, system, fetch: fetch
  * (settings.keys.yandex, settings.yandex.folder), model settings.agent.model or brain.yandex_model.
  * @param {{settings: object, roster: {people: object[], firstAlways?: string|null, teamName?: string|null}, env?: object, fetch?: Function}} o
  */
-export function agentFromSettings({ settings, roster, env = process.env, fetch: fetchImpl }) {
+export function agentFromSettings({ settings, roster, dayMode = null, env = process.env, fetch: fetchImpl, assets = loadBrainAssets() }) {
   const sel = resolveProvider(settings, { env, provider: 'yandex', model: settings.agent?.model });
-  const people = (roster?.people ?? []).filter((p) => !p.exclude).map((p) => ({ id: p.id, display: p.display, vocative: p.vocative ?? p.spoken ?? null }));
+  const system = agentPrompts({
+    assets: { ...assets, people: roster?.people ?? assets.people },
+    leadId: roster?.firstAlways ?? assets.firstAlways ?? null,
+    team: roster?.teamName ?? assets.teamName ?? null,
+    scheduled: Boolean(settings.times?.start),
+    dayMode,
+    model: sel.model,
+  });
   const agent = createDraftAgent({
     endpoint: settings.agent?.endpoint ?? ENDPOINTS.yandex,
     apiKey: requireKey(sel.keyName, env),
     model: sel.model,
-    system: buildSystemPrompt({ roster: people, leadId: roster?.firstAlways ?? null, team: roster?.teamName ?? '' }),
+    system,
     timeoutMs: settings.agent?.timeout_ms ?? 8000,
     temperature: settings.agent?.temperature ?? 0.2,
     ...(fetchImpl ? { fetch: fetchImpl } : {}),
   });
-  return Object.assign(agent, { model: sel.model, provider: 'yandex' });
+  return Object.assign(agent, { model: sel.model, provider: 'yandex', prompt: system });
 }

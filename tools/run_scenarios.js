@@ -3,7 +3,9 @@
 // agent (src/agent/draft_agent.js) on Yandex AI Studio with tool calls. Network; synthetic data only;
 // key values are never printed. Report: _internal/scenarios_<date>.json (gitignored).
 //
-//   node tools/run_scenarios.js [--model aliceai-llm-flash/latest] [--only id1,id2] [--rounds 3] [--verbose]
+//   node tools/run_scenarios.js [--model aliceai-llm-flash/latest] [--only id1,id2] [--rounds 3] [--prompt skills|draft] [--verbose]
+// --prompt skills (default, step 5): persona + the playbook blocks of the phase, from the committed
+// examples (config/*.example.*: the fictional team the scenarios are written on); draft: the base alone.
 //
 // Acceptance (docs/agent_plan.md, step 1): 0 violations (forbidden actions / invariants) and >= 90% of
 // the must-steps over 3 rounds (the model is stochastic).
@@ -15,7 +17,8 @@ import { parseArgs } from 'node:util';
 import { ENDPOINTS } from '../src/brain/client.js';
 import { SCENARIOS, SCENARIO_LEAD, SCENARIO_ROSTER } from '../src/agent/scenarios.js';
 import { describe, runScenarios } from '../src/agent/scenario_runner.js';
-import { buildSystemPrompt, createDraftAgent } from '../src/agent/draft_agent.js';
+import { agentPrompts, buildSystemPrompt, createDraftAgent } from '../src/agent/draft_agent.js';
+import { loadBrainAssets } from '../src/brain/prompt.js';
 import { formatMsk } from '../src/clock.js';
 import { loadSettings } from '../src/config.js';
 import { APP_ROOT, loadEnv, requireKey } from '../src/env.js';
@@ -30,6 +33,7 @@ async function main() {
       endpoint: { type: 'string' },
       folder: { type: 'string' },
       timeout: { type: 'string', default: '15000' },
+      prompt: { type: 'string', default: 'skills' },
     },
   });
   loadEnv();
@@ -42,15 +46,25 @@ async function main() {
   }
   const bare = values.model ?? settings.brain?.yandex_model ?? 'aliceai-llm-flash/latest';
   const model = bare.startsWith('gpt://') ? bare : `gpt://${folder}/${bare}`;
+  let system = buildSystemPrompt({ roster: SCENARIO_ROSTER, leadId: SCENARIO_LEAD });
+  if (values.prompt === 'skills') {
+    // the scenarios are written on the fictional team: its persona and playbook, never the local real ones
+    const prev = process.env.STANDUP_EXAMPLES_ONLY;
+    process.env.STANDUP_EXAMPLES_ONLY = '1';
+    const assets = loadBrainAssets();
+    if (prev === undefined) delete process.env.STANDUP_EXAMPLES_ONLY;
+    else process.env.STANDUP_EXAMPLES_ONLY = prev;
+    system = agentPrompts({ assets: { ...assets, people: SCENARIO_ROSTER }, leadId: SCENARIO_LEAD, team: 'Acme', scheduled: false, dayMode: 'daily_plans', model });
+  }
   const agent = createDraftAgent({
     endpoint: values.endpoint ?? ENDPOINTS.yandex,
     apiKey: requireKey(keyName),
     model,
-    system: buildSystemPrompt({ roster: SCENARIO_ROSTER, leadId: SCENARIO_LEAD }),
+    system,
     timeoutMs: Number(values.timeout),
   });
   const only = values.only?.split(',').map((s) => s.trim()).filter(Boolean) ?? null;
-  console.log(`model ${model}; ${only?.length ?? SCENARIOS.length} scenarios x ${values.rounds} round(s)\n`);
+  console.log(`model ${model}; prompt ${values.prompt}; ${only?.length ?? SCENARIOS.length} scenarios x ${values.rounds} round(s)\n`);
 
   let current = null;
   const report = await runScenarios(SCENARIOS, (input) => agent.decide(input), {
@@ -82,7 +96,7 @@ async function main() {
   const dir = join(APP_ROOT, '_internal');
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `scenarios_${formatMsk(new Date(), 'YYYY-MM-DD_HH-mm')}.json`);
-  writeFileSync(path, JSON.stringify({ model, ...report }, (k, v) => (v instanceof RegExp ? String(v) : v), 2));
+  writeFileSync(path, JSON.stringify({ model, prompt: values.prompt, ...report }, (k, v) => (v instanceof RegExp ? String(v) : v), 2));
   console.log(`report: ${path}`);
   return report.violations === 0 && share >= 90 ? 0 : 1;
 }

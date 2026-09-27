@@ -1662,7 +1662,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
       if (flags.brain !== false) {
         try {
           const make = D.createAgent ?? (await import('../agent/draft_agent.js')).agentFromSettings;
-          const agent = make({ settings, roster, log });
+          const agent = make({ settings, roster, log, dayMode });
           conductor = createConductor({
             state,
             agent,
