@@ -156,4 +156,30 @@ describe('replay: a scenario draft from a log', () => {
     // tkach_t -> nevsky_g (first seen), so the real Gleb becomes the fictional tkach_t («Тима»), once
     assert.deepEqual(d.steps[0].events.find((e) => e.type === 'heard'), { type: 'heard', who: 'nevsky_g', text: 'у меня всё передаю Тима' });
   });
+
+  test('ё/е, stress marks, two-letter names, guests from Telemost and the company words are all replaced', () => {
+    const real = {
+      firstAlways: 'boss',
+      keywords: ['Ромашка'],
+      people: [
+        { id: 'boss', display: 'Артём Громов', vocative: 'Арт\u0301ём', aliases: ['Артём Громов'] },
+        { id: 'dev', display: 'Ян Ли', vocative: 'Ян', aliases: ['Ян Ли'] },
+        { id: 'qa', display: 'Семён Кац', vocative: 'Сёма', aliases: ['Семён Кац'] },
+      ],
+    };
+    const tl = {
+      events: [
+        { at: 0, type: 'joined', who: 'boss', name: 'Артём Громов' },
+        { at: 0, type: 'joined', who: 'dev', name: 'Ян Ли' },
+        { at: 0, type: 'joined', who: 'guest_1', name: 'Иван Петров' },
+        { at: 1000, type: 'heard', who: 'dev', text: 'артем сегодня ревью у семена и у яна созвон с ромашкой' },
+        { at: 2000, type: 'heard', who: 'guest_1', text: 'иван петров тут я новенький' },
+        { at: 3000, type: 'heard', who: 'boss', text: 'ян а ты во сколько сема' },
+      ],
+    };
+    const d = toScenarioDraft(tl, { roster: real, fake: SCENARIO_ROSTER, fakeLead: SCENARIO_LEAD });
+    const texts = d.steps.flatMap((st) => st.events).filter((e) => e.type === 'heard').map((e) => e.text).join(' | ');
+    for (const leak of ['арт', 'сем', 'ян ', 'яна', 'иван', 'петров', 'ромашк']) assert.ok(!texts.toLowerCase().includes(leak), `«${leak}» left: ${texts}`);
+    assert.match(texts, /Acme/);
+  });
 });

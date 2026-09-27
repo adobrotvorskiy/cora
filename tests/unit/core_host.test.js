@@ -1110,3 +1110,108 @@ describe('host: agent mode (voice.host = "agent")', () => {
     await mute.finish();
   });
 });
+
+describe('host: agent mode after the review of 27.09', () => {
+  const startThen = (rest) => (input) => {
+    const text = lastHeard(input);
+    if (/начинай/.test(text)) return [{ action: 'give_word', person: 'tkach_t', text: 'Доброе утро! Тима, начнёшь?' }];
+    return rest(input, text);
+  };
+
+  test('a barge-in drops the queued ack: the turn change is undone, the ladder and give_word work again', async () => {
+    const agent = scriptAgent(
+      startThen((input, text) => {
+        if (/у меня всё/.test(text) && input.speaker === 'tkach_t') return [{ action: 'say', text: 'Поняла, спасибо.' }, { action: 'give_word', person: 'nevsky_g', text: '' }];
+        if (/дальше давай/.test(text)) return [{ action: 'give_word', person: 'nevsky_g', text: '' }];
+        return [{ action: 'skip' }];
+      }),
+    );
+    const h = makeHost({ present: ['Тимур Ткач', 'Глеб Невский'], onDemand: true, agent });
+    await h.ready();
+    final(h, 'r1', 'Кора, начинай');
+    await h.advance(1500, QUIET);
+    h.player.auto = 0; // her «Поняла» keeps playing until the barge-in
+    final(h, 'r2', 'сегодня тесты у меня всё');
+    await h.advance(600, QUIET);
+    assert.equal(h.player.plays.at(-1).meta.text, 'Поняла, спасибо.');
+    h.host.floor.onVad({ type: 'start', t: h.t.now }); // Tima talks over her: the queued ack goes with the queue
+    await h.settle(200);
+    await h.advance(400, QUIET);
+    h.host.floor.onVad({ type: 'stop', t: h.t.now });
+    h.player.auto = 30;
+    await h.advance(1500, QUIET);
+    assert.equal(h.find('turn.end_reverted').at(-1)?.why, 'orphaned');
+    assert.equal(h.host.state.current, 'tkach_t', 'the word stays with Tima');
+    const before = h.find('agent.wake').length;
+    await h.advance(3000, QUIET);
+    assert.ok(h.find('agent.wake').slice(before).some((e) => e.reason === 'silence'), 'the silence ladder is alive');
+    final(h, 'r3', 'Кора дальше давай');
+    await h.advance(2000, QUIET);
+    assert.equal(h.host.state.current, 'nevsky_g');
+    assert.ok(!h.find('agent.rejected').some((e) => e.reason === 'turn_change_in_progress'));
+    await h.finish();
+  });
+
+  test('say + give_word: her words, then a plain handoff — no «Спасибо» clip on top', async () => {
+    const agent = scriptAgent(startThen((input, text) => (/у меня всё/.test(text) && input.speaker === 'tkach_t' ? [{ action: 'say', text: 'Спасибо, Тима!' }, { action: 'give_word', person: 'nevsky_g', text: '' }] : [{ action: 'skip' }])));
+    const h = makeHost({ present: ['Тимур Ткач', 'Глеб Невский'], onDemand: true, agent });
+    await h.ready();
+    final(h, 's1', 'Кора, начинай');
+    await h.advance(1500, QUIET);
+    final(h, 's2', 'сегодня тесты у меня всё');
+    await h.advance(2500, QUIET);
+    assert.deepEqual(h.player.plays.slice(1).map((p) => p.meta.key ?? p.meta.text), ['Спасибо, Тима!', 'handoff_plain']);
+    assert.equal(h.host.state.current, 'nevsky_g');
+    await h.finish();
+  });
+
+  test('a speaker who never speaks: no «всё?», a plain handoff, skipped — the word comes back at the end', async () => {
+    const agent = scriptAgent(
+      startThen((input, text) => {
+        const sil = input.events.filter((e) => e.type === 'silence').at(-1);
+        if (/у меня всё/.test(text) && input.speaker === 'tkach_t') return [{ action: 'give_word', person: 'nevsky_g', text: '' }];
+        if (input.speaker === 'nevsky_g' && sil?.ms >= 2500 && sil.ms < 6000) return [{ action: 'ask_done', person: 'nevsky_g' }];
+        if (input.speaker === 'nevsky_g' && sil?.ms >= 6000) return [{ action: 'say', text: 'Глеб, тебя не слышно, вернусь к тебе в конце.' }, { action: 'give_word', person: 'belozersky_s', text: '' }];
+        return [{ action: 'skip' }];
+      }),
+    );
+    const h = makeHost({ present: ['Тимур Ткач', 'Глеб Невский', 'Сергей Белозерский'], onDemand: true, agent });
+    await h.ready();
+    final(h, 'q1', 'Кора, начинай');
+    await h.advance(1500, QUIET);
+    final(h, 'q2', 'сегодня тесты у меня всё');
+    await h.advance(1500, QUIET);
+    assert.equal(h.host.state.current, 'nevsky_g');
+    await h.advance(8000, QUIET);
+    assert.ok(!h.player.plays.some((p) => p.meta.key === 'check_done'), 'no «Глеб, всё?» to someone silent');
+    assert.ok(h.find('agent.rejected').some((e) => e.reason === 'not_started'));
+    assert.equal(h.host.state.current, 'belozersky_s');
+    assert.equal(h.host.state.get('nevsky_g').status, 'skipped');
+    assert.ok(!h.player.plays.slice(-2).some((p) => p.meta.key === 'ack'), 'no «Спасибо» for silence');
+    assert.ok(agent.calls.at(-1).input.queue.includes('nevsky_g'), 'Gleb is back in the queue');
+    await h.finish();
+  });
+
+  test('the opening line is still waiting: a handoff decided meanwhile is refused (the round has not begun)', async () => {
+    const agent = scriptAgent((input) => {
+      const text = lastHeard(input);
+      if (/начинай/.test(text)) return [{ action: 'say', text: 'Привет всем, рада слышать!' }, { action: 'give_word', person: 'tkach_t', text: 'Тима, начнёшь?' }];
+      if (/глеб первый/.test(text)) return [{ action: 'give_word', person: 'nevsky_g', text: '' }];
+      return [{ action: 'skip' }];
+    });
+    const h = makeHost({ present: ['Тимур Ткач', 'Глеб Невский'], onDemand: true, agent });
+    await h.ready();
+    h.player.auto = 0;
+    final(h, 'g1', 'Кора, начинай');
+    await h.advance(600, QUIET);
+    assert.deepEqual(h.host._test.queued(), ['start']);
+    final(h, 'g2', 'нет глеб первый');
+    await h.advance(800, QUIET);
+    h.player.plays.at(-1).complete();
+    h.player.auto = 30;
+    await h.advance(2000, QUIET);
+    assert.ok(h.find('agent.rejected').some((e) => e.reason === 'start_pending'));
+    assert.ok(h.host.phase !== 'waiting' || !h.host.state.current, `never a speaker while waiting: phase ${h.host.phase}, current ${h.host.state.current}`);
+    await h.finish();
+  });
+});

@@ -73,6 +73,7 @@ const SPEAK_REPEAT_MS = 30_000; // live 27.09: the brain re-asked «кто хо�
 const RECENT_SAID_KEEP_MS = 60_000;
 const SMALL_GROUP_MAX = 2; // people in the room (without her) up to which every line goes to the brain
 const EMPTY_ROOM_LEAVE_MS = 15_000; // after the round started: everyone left this long ago -> she leaves silently
+const ORPHAN_MS = 600; // agent mode: a turn change / closing / start with nothing left to play this long is reverted
 const START_REPLY_WINDOW_MS = 12_000; // «давай начнём» without her name, this soon after her own line, is a reply to her
 const BRAIN_ON_BARGE_KINDS = new Set(['answer', 'speak', 'greeting', 'proposal']);
 const COST = Object.freeze({ usd_rub: 90, realtime_audio_in_per_m: 32, realtime_audio_out_per_m: 64, realtime_text_in_per_m: 4, realtime_text_out_per_m: 16, transcribe_per_min: 0.006 });
@@ -271,6 +272,8 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     closingStarted: false,
     closingBarged: false,
     lastCheckDoneFor: null,
+    startPending: false, // the opening line is queued / playing (the round starts when it ends)
+    orphanSince: null, // agent mode: since when a flow waits for a line that is gone (healAgentFlows)
     lastAckFor: null, // agent mode: the ack «Спасибо, X!» already played for X (a re-decided handoff does not thank twice)
     bargeText: null, // the recognized words that stopped her (agent: the interrupted event)
     turnEnd: null, // {at, prev, to, reason, phase} while a turn-end playback (ack/handoff/open floor) is in flight
@@ -661,7 +664,8 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
   /** Agent mode: her lines still waiting (queued or at the floor gate) with an epoch older than `epoch` are dropped. */
   function dropAgentLines(epoch) {
     let n = 0;
-    const hit = (spec) => spec && spec.agentEpoch != null && spec.agentEpoch < epoch && !spec.superseded;
+    // an answer to her name plays within forceAfterMs whatever follows: dropping it would lose the answer (review 27.09)
+    const hit = (spec) => spec && spec.agentEpoch != null && spec.agentEpoch < epoch && !spec.superseded && !(spec.kind === 'agent_say' && spec.forceAfterMs);
     for (const item of speechQueue) {
       if (hit(item.spec)) {
         item.spec.superseded = true;
@@ -690,7 +694,14 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
   /** The executor behind the agent's tools (src/agent/conductor.js checks the invariants first). */
   function agentIo() {
     const text = (t) => (t ? guards.limitText(t) || null : null);
-    const busyTurn = () => (flow.turnEnd ? { ok: false, reason: 'turn_change_in_progress' } : flow.closingStarted ? { ok: false, reason: 'closing' } : null);
+    const busyTurn = () =>
+      flow.turnEnd ? { ok: false, reason: 'turn_change_in_progress' } : flow.closingStarted ? { ok: false, reason: 'closing' } : flow.startPending ? { ok: false, reason: 'start_pending' } : null;
+    /** Mark the turn change the agent started: prevSilent (the speaker never spoke) and the phase to return to on a revert. */
+    const markTurnEnd = (o, phase) => {
+      if (!flow.turnEnd) return;
+      if (o.silentPrev) flow.turnEnd.prevSilent = true;
+      if (phase) flow.turnEnd.phase = phase;
+    };
     return {
       say: ({ text: t, how, epoch }) => {
         const line = text(t);
@@ -703,32 +714,38 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
         if (how === 'name') flow.startRequestedAt ??= nowMs(); // «Кора, начинай»: the opening line may not wait for a noisy room
         return asAgent(epoch, () => startRound(person, text(t)));
       },
-      giveWord: ({ person, text: t, epoch }) => {
+      giveWord: (o) => {
         const busy = busyTurn();
         if (busy) return busy;
-        if (!flow.roundStarted) return asAgent(epoch, () => startRound(person, text(t)));
-        return asAgent(epoch, () => {
-          if (state.phase === 'open_floor') {
+        if (!flow.roundStarted) return asAgent(o.epoch, () => startRound(o.person, text(o.text)));
+        return asAgent(o.epoch, () => {
+          const fromPhase = state.phase;
+          if (fromPhase === 'open_floor') {
             state.setPhase('round'); // a late joiner who has not spoken yet
             bump();
           }
           const prev = state.current;
           const prevGone = prev && !state.get(prev)?.present;
-          if (t || prevGone || (prev && flow.lastAckFor === prev)) return handoff(person, text(t), { reason: 'agent', plain: !t });
-          state.planInsert(person, { front: true });
-          endTurnSequence('agent');
+          // no «Спасибо, X!» clip: her own words, she has just spoken, X said nothing, X left, or X was thanked already
+          if (o.text || o.said || o.silentPrev || prevGone || (prev && flow.lastAckFor === prev)) handoff(o.person, text(o.text), { reason: 'agent', plain: !o.text });
+          else {
+            state.planInsert(o.person, { front: true });
+            endTurnSequence('agent');
+          }
+          markTurnEnd(o, fromPhase === 'open_floor' ? 'open_floor' : null);
         });
       },
       askDone: ({ person, epoch }) => asAgent(epoch, () => say({ key: 'check_done', person, kind: 'check_done' })),
-      openFloor: ({ epoch }) => {
+      openFloor: (o) => {
         const busy = busyTurn();
         if (busy) return busy;
         if (state.phase !== 'round') return { ok: false, reason: 'not_in_round' };
-        return asAgent(epoch, () => {
+        return asAgent(o.epoch, () => {
           state.setPlan({ next: null, then: [] });
           const prev = state.current;
-          if (!prev || !state.get(prev)?.present || flow.lastAckFor === prev) return openFloor('agent');
-          endTurnSequence('agent');
+          if (!prev || !state.get(prev)?.present || o.said || o.silentPrev || flow.lastAckFor === prev) openFloor('agent');
+          else endTurnSequence('agent');
+          markTurnEnd(o, null);
         });
       },
       leave: ({ text: t, epoch }) => {
@@ -742,6 +759,38 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
       quiet: () => quiet,
       alert: (t) => alert(t, 'warn'),
     };
+  }
+
+  /**
+   * Agent mode: a flow waits for the end of a line that will never come (a barge-in or «Кора, стоп»
+   * cleared the queue: the ack, the handoff, the farewell or the opening line went without their
+   * callbacks). Nothing playing, queued or at the gate for ORPHAN_MS -> undo it, as a barge-in would.
+   * Without this, flow.turnEnd stays set: no silence wakes, every give_word refused (review 27.09).
+   */
+  function healAgentFlows(t) {
+    const idle = !currentSpeech && !speechQueue.length && !gateSpec && !speechPumpRunning && !hostState.speaking;
+    if (!idle || !(flow.turnEnd || flow.closingStarted || flow.startPending) || done) {
+      flow.orphanSince = null;
+      return;
+    }
+    flow.orphanSince ??= t;
+    if (t - flow.orphanSince < ORPHAN_MS) return;
+    flow.orphanSince = null;
+    if (flow.startPending) {
+      flow.startPending = false;
+      flow.roundStarted = false;
+      if (state.phase === 'round') state.setPhase('waiting');
+      bump();
+      ev('round.start_dropped', { reason: 'orphaned' });
+    }
+    if (flow.turnEnd) revertTurnEnd('orphaned');
+    if (flow.closingStarted) {
+      flow.closingStarted = false;
+      state.setPhase(state.current ? 'round' : 'open_floor');
+      if (state.current) floor.resumeTurn();
+      bump();
+      ev('round.closing_reverted', { reason: 'orphaned', phase: state.phase });
+    }
   }
 
   // ------------------------------------------------------------------------------------- brain
@@ -922,12 +971,14 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     if (flow.roundStarted || done) return;
     const key = clipKeyForStart(id);
     flow.roundStarted = true;
+    flow.startPending = true;
     flow.proposalPending = false;
     state.setPhase('round');
     bump();
     ev('round.start', { first: id, key, day_mode: dayMode, lead_present: state.leadPresent() });
     const asked = cascade && flow.startRequestedAt !== null; // «Кора, начинай»: people are waiting for her
     say({ key: text ? null : key, text, person: id, kind: 'start', maxWaitMs: 15_000, ...(asked ? { forceAfterMs: ADDRESSED_FORCE_MS } : {}) }, (r) => {
+      flow.startPending = false;
       if (dropped(r)) {
         // agent mode: people spoke again before the opening line played — the agent decides anew
         flow.roundStarted = false;
@@ -1006,8 +1057,9 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
       if (r.status === 'aborted') return revertTurnEnd('barge_in_during_handoff');
       if (dropped(r)) return revertTurnEnd('dropped_handoff');
       if (r.status === 'skipped' && r.reason === 'room_active') return postponeTurnEnd(to);
+      if (agentMode && state.phase !== 'round') return revertTurnEnd('phase_changed'); // the round was undone while the handoff waited
       const te = flow.turnEnd;
-      if (prev && state.current === prev) state.finishTurn({ t: nowMs(), status: te?.reason === 'no_speech' ? 'skipped' : 'spoke' });
+      if (prev && state.current === prev) state.finishTurn({ t: nowMs(), status: prevStatus(prev, te) });
       beginTurn(to);
     });
   }
@@ -1026,7 +1078,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
       if (dropped(r)) return revertTurnEnd('dropped_open_floor');
       if (r.status === 'skipped' && r.reason === 'room_active') return revertTurnEnd('room_active_at_open_floor');
       const te = flow.turnEnd;
-      if (prev && state.current === prev) state.finishTurn({ t: nowMs(), status: te?.reason === 'no_speech' ? 'skipped' : 'spoke' });
+      if (prev && state.current === prev) state.finishTurn({ t: nowMs(), status: prevStatus(prev, te) });
       floor.endTurn();
       attribution.setPresumed(null);
       flow.turnEnd = null;
@@ -1035,6 +1087,14 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
       bump();
       ev('round.open_floor_asked', { ...state.summary() });
     });
+  }
+
+  /** How the previous speaker's turn ends: skipped (the word comes back at the end) or spoke. */
+  function prevStatus(prev, te) {
+    if (te?.reason === 'no_speech') return 'skipped';
+    // agent mode: never said a word in the turn — skipped once, the second silent turn counts as done
+    if (te?.prevSilent) return (state.get(prev)?.turns ?? 0) < 2 ? 'skipped' : 'spoke';
+    return 'spoke';
   }
 
   /** The turn end was false (someone spoke over the ack / handoff / open floor): restore everything. */
@@ -1196,6 +1256,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
 
   function onParticipants(list, source) {
     if (done || leaving) return;
+    const speaker = state.current; // applyParticipants forgets the speaker who left: remember him for speaker_left
     const diff = state.applyParticipants(list, { t: nowMs() });
     if (!diff.changed) return;
     for (const id of diff.joined) {
@@ -1238,7 +1299,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
       }
     }
     for (const id of diff.left) {
-      if (id === state.current && state.phase === 'round') {
+      if (id === speaker && state.phase === 'round' && !flow.turnEnd && state.presentIds().length) {
         ev('turn.speaker_left', { who: id });
         floor.endTurn();
         flow.turnEnd = null;
@@ -1414,7 +1475,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
         ...(f.track_id ? { track: f.track_id.slice(0, 8), via: who.via, ...(who.alt?.length ? { alt: who.alt } : {}), stt_ms: f.latency_ms ?? null } : {}),
         ...(f.t_speech_start != null ? { t0: f.t_speech_start, t1: f.t_speech_end ?? null } : {}),
       });
-      if (quiet && !kill && !quietHit) {
+      if (quiet && !kill && !quietHit && guards.mentionsHost(text)) {
         quiet = false; // a final line addressed to her by name: she is back (not the quiet phrase itself)
         ev('host.quiet_lifted', { source: 'voice', text: text.slice(0, 120) });
       }
@@ -1606,7 +1667,10 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     serial.run(() => {
       if (done) return;
       for (const timer of guards.dueTimers(nowMs())) onTimer(timer);
-      if (agentMode) conductor?.tick(t);
+      if (agentMode) {
+        healAgentFlows(t);
+        conductor?.tick(t);
+      }
       else if (!flow.roundStarted && state.phase !== 'silent') {
         if (flow.proposeAt !== null && nowMs() >= flow.proposeAt && nowMs() >= flow.holdUntil && !flow.proposalPending && !state.leadPresent()) {
           if (!brain || nowMs() >= flow.proposeAt + GREETING_GRACE_MS) {

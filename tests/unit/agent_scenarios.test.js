@@ -138,7 +138,7 @@ describe('draft agent', () => {
     assert.match(prompt, /orlov_y — Ярослав Орлов \(зовёшь «Слава»\), руководитель/);
     assert.match(prompt, /Отвечай только вызовами инструментов/);
     assert.deepEqual(TOOLS.map((t) => t.function.name), ['say', 'give_word', 'ask_done', 'open_floor', 'skip', 'leave']);
-    assert.match(prompt, /2,5 с без «у меня всё» — спроси «всё\?»/);
+    assert.match(prompt, /2,5 с без «у меня всё» — ask_done, если он уже говорил/);
     assert.match(prompt, /rejected/);
     const input = JSON.parse(renderInput({ phase: 'round', speaker: 'tkach_t', present: ['tkach_t'], dialog: Array.from({ length: 20 }, (_, i) => ({ who: 'tkach_t', text: `${i}` })), events: [] }));
     assert.equal(input.dialog.length, 12);

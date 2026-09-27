@@ -358,33 +358,44 @@ export function toScenarioDraft(tl, { from = 0, to = Infinity, roster, fake, fak
     }
     return map.get(who).id;
   };
-  const strip = (s) => String(s ?? '').replace(/́/g, '');
+  // STT and people.json disagree on ё and stress marks: names and text are matched folded (ё -> е keeps the
+  // indices, so the draft keeps the original letters)
+  const unstress = (s) => String(s ?? '').replace(/\u0301/g, '');
+  const strip = (s) => unstress(s).replace(/ё/g, 'е').replace(/Ё/g, 'Е');
   const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const forms = [];
-  for (const [rid, p] of real) {
-    const words = [p.display, ...(p.aliases ?? []), p.spoken, p.vocative, p.vocative_gen, p.vocative_acc, p.surname_spoken].filter(Boolean).map(strip);
-    for (const w of new Set(words.flatMap((x) => [x, ...x.split(/\s+/)]))) {
-      if (w.length < 3) continue;
-      // inflected forms too («у Пети», «Анной»): the stem plus a short ending; STT writes names in lower case
-      const stem = w.includes(' ') ? esc(w) : w.length >= 4 ? `${esc(w.slice(0, -1))}\\p{L}{0,3}` : `${esc(w.slice(0, 2))}\\p{L}{1,2}`;
-      forms.push({ rid, re: new RegExp(`(?<![\\p{L}])${stem}(?![\\p{L}])`, 'giu') });
+  const addForms = (rid, names, replacement = null) => {
+    for (const w of new Set(names.filter(Boolean).map(strip).flatMap((x) => [x, ...x.split(/\s+/)]))) {
+      if (w.length < 2) continue;
+      // inflected forms too («у Пети», «Анной», «у Яна»): the stem plus a short ending; STT writes names in lower case
+      const stem = w.includes(' ') ? esc(w) : w.length >= 4 ? `${esc(w.slice(0, -1))}\\p{L}{0,3}` : w.length === 3 ? `${esc(w.slice(0, 2))}\\p{L}{1,2}` : `${esc(w)}\\p{L}{0,2}`;
+      forms.push({ rid, replacement, re: new RegExp(`(?<![\\p{L}])${stem}(?![\\p{L}])`, 'giu') });
     }
-  }
-  const vocOf = (rid) => {
-    fakeOf(rid);
-    return map.get(rid)?.vocative ?? 'коллега';
+  };
+  for (const [rid, p] of real) addForms(rid, [p.display, ...(p.aliases ?? []), p.spoken, p.vocative, p.vocative_gen, p.vocative_acc, p.surname_spoken]);
+  // guests: their Telemost names from presence.joined (not in people.json)
+  const telemostNames = { ...(tl.names ?? {}) };
+  for (const e of tl.events) if (e.type === 'joined' && e.name) telemostNames[e.who] ??= e.name;
+  for (const [gid, name] of Object.entries(telemostNames)) if (!real.has(gid)) addForms(gid, [name]);
+  // the company and its clients (people.json keywords): a neutral stand-in
+  for (const k of roster?.keywords ?? []) addForms(`kw:${k}`, [k], 'Acme');
+  const vocOf = (f) => {
+    if (f.replacement) return f.replacement;
+    fakeOf(f.rid);
+    return map.get(f.rid)?.vocative ?? 'коллега';
   };
   // one pass over the original text: a replaced name is never matched again (a fictional name may equal a real one)
   const scrub = (text) => {
-    const src = strip(text);
+    const src = unstress(text);
+    const folded = strip(src);
     const hits = [];
-    for (const f of forms) for (const m of src.matchAll(f.re)) hits.push({ start: m.index, end: m.index + m[0].length, rid: f.rid });
+    for (const f of forms) for (const m of folded.matchAll(f.re)) hits.push({ start: m.index, end: m.index + m[0].length, f });
     hits.sort((a, b) => a.start - b.start || b.end - b.start - (a.end - a.start));
     let out = '';
     let pos = 0;
     for (const h of hits) {
       if (h.start < pos) continue;
-      out += src.slice(pos, h.start) + vocOf(h.rid);
+      out += src.slice(pos, h.start) + vocOf(h.f);
       pos = h.end;
     }
     return out + src.slice(pos);

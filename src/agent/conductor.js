@@ -17,8 +17,10 @@
 // room is quiet when it arrives. Log: agent.wake / agent.decision / agent.aborted / agent.rejected /
 // agent.dropped / agent.text_only / agent.error / agent.budget.
 //
-// io (the host): say({text, how, epoch}) · startRound({person, text, how, epoch}) · giveWord({person, text, epoch})
-// · askDone({person, epoch}) · openFloor({epoch}) · leave({text, epoch}) -> {ok, reason?}; drop(epoch) -> n
+// io (the host): say({text, how, epoch}) · startRound({person, text, how, epoch}) · giveWord({person, text, epoch,
+// said, silentPrev}) · askDone({person, epoch}) · openFloor({epoch, said, silentPrev}) · leave({text, epoch})
+// -> {ok, reason?} (said: she has just said something in this decision — no ack clip on top; silentPrev: the
+// speaker never spoke in the turn — no ack, marked skipped); drop(epoch) -> n
 // (her lines still waiting with an older epoch); roomSpeaking() · hostBusy() · canSpeak() · quiet(); alert(text).
 // `how` (src/core/addressing.js mayAnswer): was one of the lines she answers addressed to her ('name' = by name).
 
@@ -33,6 +35,10 @@ export const SILENCE_REPEATS = 3;
 export const ASK_DONE_MIN_SILENCE_MS = 2500;
 /** A `say` nobody asked for (no line addressed to her among the ones it answers): at most one per this. */
 export const UNSOLICITED_EVERY_MS = 20_000;
+/** On the open floor additions are answers to her question («Принято, Глеб. Кто-то ещё?»): a shorter limit. */
+export const UNSOLICITED_OPEN_FLOOR_MS = 8000;
+/** A line addressed to her stays «addressed» this long, until she has answered (a dropped answer is re-decided). */
+export const ADDRESSED_KEEP_MS = 20_000;
 export const SAY_REPEAT_MS = 30_000;
 export const MAX_PREEMPTS = 2;
 export const DEFAULT_BUDGET = Object.freeze({ max_calls: 800, max_tokens: 4_000_000, max_rub: null });
@@ -84,6 +90,8 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
   let lastHerKind = null;
   let lastBusyAt = -Infinity;
   let askedDoneFor = null;
+  let spokeIn = null; // the speaker who has said something since getting the word (ask_done needs it)
+  let lastAddressed = null; // {how, t}: the last line addressed to her, until she answers
   let lastUnsolicitedAt = -Infinity;
   const ladder = { from: null, fired: 0, repeats: 0 };
   const stats = { wakes: 0, decisions: 0, aborted: 0, errors: 0, rejected: 0, dropped: 0, text_only: 0, tokens_in: 0, tokens_out: 0, rub: 0, disabled: null };
@@ -146,7 +154,11 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
     push({ type: 'heard', who, text: s }, how);
     lastHumanAt = Math.max(lastHumanAt, t);
     resetLadder(t);
-    if (who === state.current || who === '?') askedDoneFor = null;
+    if (how) lastAddressed = { how, t };
+    if (state.current && (who === state.current || who === '?')) {
+      askedDoneFor = null;
+      spokeIn = state.current;
+    }
     if (letters(s) < 2) return; // «а», «м»: in the dialog, not worth a wake
     bump('heard');
     wake('heard');
@@ -160,6 +172,7 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
     lastHerEndAt = Math.max(lastHerEndAt, t);
     lastHerKind = kind;
     if (kind === 'check_done' && !cut) askedDoneFor = state.current;
+    if (!cut && (kind === 'agent_say' || kind === 'start' || kind === 'handoff') && lastAddressed && lastAddressed.t <= t) lastAddressed = null; // answered
     resetLadder(t);
   }
 
@@ -187,7 +200,7 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
 
   function timer(name) {
     push({ type: 'timer', name });
-    if (name === 'start') wake('timer');
+    if (name === 'start' || name === 'wait_lead_until') wake('timer'); // before the start there is no silence ladder
   }
 
   // --------------------------------------------------------------------------------------- wake
@@ -217,6 +230,8 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
     let due = false;
     if (ladder.fired < stages.length && ms >= stages[ladder.fired]) {
       while (ladder.fired < stages.length && ms >= stages[ladder.fired]) ladder.fired++;
+      // late (a join re-armed the ladder after a long silence): the repeats already due are not fired in a burst
+      ladder.repeats = Math.min(SILENCE_REPEATS, Math.max(ladder.repeats, Math.floor((ms - stages.at(-1)) / SILENCE_REPEAT_MS)));
       due = true;
     } else if (ladder.fired >= stages.length && ladder.repeats < SILENCE_REPEATS && ms >= stages.at(-1) + (ladder.repeats + 1) * SILENCE_REPEAT_MS) {
       ladder.repeats++;
@@ -345,13 +360,14 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
         if (!a.text) return 'empty_text';
         if (ctx.said) return 'one_say_per_decision';
         if ((sit.phase === 'waiting' || sit.phase === 'round') && sit.present.length >= 3 && !ctx.how) return 'not_addressed';
-        if (!ctx.how && t - lastUnsolicitedAt < UNSOLICITED_EVERY_MS) return 'too_often';
+        if (!ctx.how && t - lastUnsolicitedAt < (sit.phase === 'open_floor' ? UNSOLICITED_OPEN_FLOOR_MS : UNSOLICITED_EVERY_MS)) return 'too_often';
         if (!ctx.repeatAsked && saidLately(a.text, t)) return 'repeat';
         return null;
       case 'give_word':
         if (state.get(a.person)?.status === 'spoke') return 'already_spoke';
         return null;
       case 'ask_done':
+        if (spokeIn !== a.person) return 'not_started'; // «Глеб, всё?» to someone who has not said a word yet
         if (askedDoneFor === a.person) return 'already_asked';
         if (t - Math.max(lastHumanAt, lastHerEndAt) < ASK_DONE_MIN_SILENCE_MS) return 'too_early';
         return null;
@@ -363,11 +379,15 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
   function execute(actions, used) {
     const sit = situation();
     const hows = used.map((p) => p.how).filter(Boolean);
-    const how = hows.includes('name') ? 'name' : (hows.at(-1) ?? null); // by name anywhere: the answer may not wait
+    // by name anywhere: the answer may not wait; a question whose answer was dropped (a newer line) is still hers
+    const kept = lastAddressed && now() - lastAddressed.t <= ADDRESSED_KEEP_MS ? lastAddressed.how : null;
+    const how = hows.includes('name') ? 'name' : (hows.at(-1) ?? kept);
     const lastHeard = used.filter((p) => p.e.type === 'heard').at(-1)?.e.text ?? '';
     const ctx = { turnDone: false, said: false, how, repeatAsked: REPEAT_ASK_RE.test(lastHeard) };
     let accepted = 0;
-    for (const a of actions) {
+    // an answer goes before the handoff whatever order the model wrote them in
+    const ordered = [...actions].sort((x, y) => (x?.action === 'say' ? 0 : 1) - (y?.action === 'say' ? 0 : 1));
+    for (const a of ordered) {
       if (!a?.action || a.action === 'skip') continue;
       if (a.action === 'none') {
         stats.text_only++;
@@ -378,7 +398,9 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
         reject(a, 'unknown_tool');
         continue;
       }
-      const why = violation(a, sit, { leadId }) ?? hostCheck(a, sit, ctx);
+      // «начнём с Глеба» from the lead himself: the lead-first rule gives way
+      const leadAsked = a.action === 'give_word' && sit.phase === 'waiting' && used.some((p) => p.e.type === 'heard' && p.e.who === leadId && namesPerson(p.e.text, a.person));
+      const why = violation(a, sit, { leadId: leadAsked ? null : leadId }) ?? hostCheck(a, sit, ctx);
       if (why) {
         reject(a, why);
         continue;
@@ -390,8 +412,17 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
     if (accepted) rejectWakes = 0;
   }
 
+  /** Does a line name this person (short name or first name, any ending)? */
+  function namesPerson(text, id) {
+    const words = fold(text).split(' ');
+    const forms = [state.vocative?.(id), String(state.displayName?.(id) ?? '').split(/\s+/)[0]].map((x) => fold(x)).filter((x) => x.length >= 3);
+    return forms.some((f) => words.some((w) => w.startsWith(f.slice(0, Math.max(3, f.length - 1)))));
+  }
+
   function run(a, sit, ctx) {
     const text = a.text ?? null;
+    // the speaker never spoke in the turn: no «Спасибо», and the host marks him skipped (the word comes back at the end)
+    const silentPrev = Boolean(sit.speaker) && spokeIn !== sit.speaker;
     switch (a.action) {
       case 'say':
         ctx.said = true;
@@ -399,13 +430,13 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
         return io.say({ text, how: ctx.how, epoch });
       case 'give_word':
         ctx.turnDone = true;
-        return sit.phase === 'waiting' ? io.startRound({ person: a.person, text, how: ctx.how, epoch }) : io.giveWord({ person: a.person, text, epoch });
+        return sit.phase === 'waiting' ? io.startRound({ person: a.person, text, how: ctx.how, epoch }) : io.giveWord({ person: a.person, text, epoch, said: ctx.said, silentPrev });
       case 'ask_done':
         ctx.turnDone = true;
         return io.askDone({ person: a.person, epoch });
       case 'open_floor':
         ctx.turnDone = true;
-        return io.openFloor({ epoch });
+        return io.openFloor({ epoch, said: ctx.said, silentPrev });
       case 'leave':
         ctx.turnDone = true;
         return io.leave({ text, epoch });

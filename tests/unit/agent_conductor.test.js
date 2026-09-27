@@ -489,6 +489,106 @@ describe('conductor: the executor', () => {
   });
 });
 
+describe('conductor: after the review of 27.09', () => {
+  test('an answer to her name dropped by an unrelated line is still hers: the re-decision is not refused', async () => {
+    const w = makeWorld({ present: ['tkach_t', 'nevsky_g', 'orlov_y'], phase: 'round', speaker: 'nevsky_g', queue: ['orlov_y'] });
+    w.heard('tkach_t', 'Кора а ты вообще кто такая');
+    await flush();
+    w.agent.calls[0].answer([{ action: 'say', text: 'Я Кора, ИИ-ведущая стендапа.' }]);
+    await flush();
+    w.clock.t += 800;
+    w.heard('nevsky_g', 'и ещё сегодня деплой на стейдж'); // the speaker goes on: her waiting answer is dropped
+    await flush();
+    assert.equal(w.io.queued[0].dropped, true);
+    w.agent.open()[0].answer([{ action: 'say', text: 'Я Кора, ИИ-ведущая стендапа.' }]);
+    await flush();
+    assert.deepEqual(w.find('agent.rejected'), []);
+    assert.equal(w.calls.at(-1).how, 'name');
+    w.her('Я Кора, ИИ-ведущая стендапа.', { kind: 'agent_say' }); // answered: the next unrelated say is hers no more
+    w.clock.t += 3000;
+    w.heard('nevsky_g', 'потом ревью');
+    await flush();
+    w.agent.open()[0].answer([{ action: 'say', text: 'Отлично.' }]);
+    await flush();
+    assert.deepEqual(w.find('agent.rejected').map((e) => e.reason), ['not_addressed']);
+  });
+
+  test('a join after a long silence: one wake, not a burst of the missed repeats', async () => {
+    const w = makeWorld({ present: ['tkach_t', 'nevsky_g'], phase: 'open_floor' });
+    w.her('Все высказались. Кто хочет что-то добавить или спросить?');
+    for (let i = 0; i < 40; i++) {
+      await w.wait(1000);
+      for (const c of w.agent.open()) c.answer([{ action: 'skip' }]);
+    }
+    const n = w.agent.calls.length;
+    w.setPresent(['tkach_t', 'nevsky_g', 'orlov_y']);
+    for (let i = 0; i < 50; i++) {
+      await w.wait(100);
+      for (const c of w.agent.open()) c.answer([{ action: 'skip' }]);
+    }
+    assert.equal(w.agent.calls.length - n, 1);
+  });
+
+  test('ask_done only once the speaker has said something; a silent speaker is handed over as silentPrev, a thanked one as said', async () => {
+    const w = makeWorld({ present: ['tkach_t', 'nevsky_g', 'orlov_y'], phase: 'round', speaker: 'nevsky_g', queue: ['orlov_y'] });
+    w.her('Дальше Глеб.', { kind: 'handoff' });
+    await w.wait(2600);
+    w.agent.open()[0].answer([{ action: 'ask_done', person: 'nevsky_g' }]);
+    await flush();
+    assert.deepEqual(w.find('agent.rejected').map((e) => e.reason), ['not_started'], '«Глеб, всё?» before Gleb said a word');
+    await w.wait(4000);
+    for (const c of w.agent.open()) c.answer([{ action: 'give_word', person: 'orlov_y', text: '' }]);
+    await flush();
+    assert.deepEqual([w.calls.at(-1).tool, w.calls.at(-1).silentPrev, w.calls.at(-1).said], ['giveWord', true, false]);
+
+    const t = makeWorld({ present: ['tkach_t', 'nevsky_g'], phase: 'round', speaker: 'tkach_t', queue: ['nevsky_g'] });
+    t.heard('tkach_t', 'сегодня тесты у меня всё');
+    await flush();
+    t.agent.calls[0].answer([{ action: 'give_word', person: 'nevsky_g', text: '' }, { action: 'say', text: 'Поняла, спасибо.' }]);
+    await flush();
+    assert.deepEqual(t.calls.map((c) => c.tool), ['say', 'giveWord'], 'the answer goes before the handoff');
+    assert.deepEqual([t.calls[1].said, t.calls[1].silentPrev], [true, false]);
+  });
+
+  test('the lead asks to start with a colleague: the lead-first rule gives way; someone else asking does not', async () => {
+    const w = makeWorld({ present: ['tkach_t', 'nevsky_g', 'orlov_y'] });
+    w.heard('orlov_y', 'Кора начинай давай с Глеба');
+    await flush();
+    w.agent.calls[0].answer([{ action: 'give_word', person: 'nevsky_g', text: 'Доброе утро! Глеб, начнёшь?' }]);
+    await flush();
+    assert.deepEqual(w.find('agent.rejected'), []);
+    const o = makeWorld({ present: ['tkach_t', 'nevsky_g', 'orlov_y'] });
+    o.heard('tkach_t', 'Кора начинай давай с Глеба');
+    await flush();
+    o.agent.calls[0].answer([{ action: 'give_word', person: 'nevsky_g', text: '' }]);
+    await flush();
+    assert.deepEqual(o.find('agent.rejected').map((e) => e.reason), ['lead_goes_first']);
+  });
+
+  test('open floor: every addition may be acknowledged (8 s apart), not one per 20 s', async () => {
+    const w = makeWorld({ present: ['tkach_t', 'nevsky_g', 'orlov_y'], phase: 'open_floor' });
+    w.heard('nevsky_g', 'я добавлю завтра деплой');
+    await flush();
+    w.agent.calls[0].answer([{ action: 'say', text: 'Принято, Глеб. Кто-то ещё?' }]);
+    await flush();
+    w.clock.t += 9000;
+    w.heard('orlov_y', 'и ретро в пятницу');
+    await flush();
+    w.agent.open()[0].answer([{ action: 'say', text: 'Принято, Слава. Кто-то ещё?' }]);
+    await flush();
+    assert.deepEqual(w.find('agent.rejected'), []);
+    assert.equal(w.calls.length, 2);
+  });
+
+  test('scheduled mode: wait_lead_until wakes the agent before the start', async () => {
+    const w = makeWorld({ present: ['tkach_t', 'nevsky_g'] });
+    w.c.timer('wait_lead_until');
+    await flush();
+    assert.equal(w.agent.calls.length, 1);
+    assert.deepEqual(w.agent.calls[0].input.events.at(-1), { type: 'timer', name: 'wait_lead_until' });
+  });
+});
+
 // --------------------------------------------------------------------------- scenarios, host path
 
 const isAskDone = (text) => /всё\?\s*$/i.test(text);

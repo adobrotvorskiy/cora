@@ -5,9 +5,10 @@
 //
 //   node tools/log_to_scenario.js logs/testroom_2026-09-27_run2.jsonl --from 03:10 --to 04:05 [--id why_silent]
 //
-// Output: the draft on stdout and in _internal/scenario_<id>.json. Before it goes to git: write
-// `expect` / `ideal` / `forbid` for each step and CHECK THE TEXT FOR REAL DATA (short names, companies,
-// clients from people.json keywords are not replaced automatically).
+// Output: the draft on stdout and in _internal/scenario_<id>.json. Replaced: people.json names (any
+// ending, ё/е), guests' Telemost names, people.json keywords (-> «Acme»). Before it goes to git: write
+// `expect` / `ideal` / `forbid` for each step and CHECK THE TEXT FOR REAL DATA (names nobody put in
+// people.json, projects, numbers).
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -41,5 +42,5 @@ const out = join(dir, `scenario_${values.id}.json`);
 writeFileSync(out, JSON.stringify(draft, null, 2));
 console.log(JSON.stringify(draft, null, 2));
 console.log(`\n${draft.steps.length} step(s) from ${clockOf(mmss(values.from) ?? 0)}; draft: ${out}`);
-if (leftovers.length) console.log(`!! words from people.json keywords are still in the draft: ${leftovers.length} — replace them by hand`);
+if (leftovers.length) console.log(`!! still in the draft (people.json keywords): ${leftovers.join(', ')} — replace them by hand`);
 console.log('Write expect / ideal / forbid for each step and check the text for real data before it goes to git.');
