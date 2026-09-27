@@ -680,6 +680,56 @@ describe('host: open floor in a 1:1', () => {
   });
 });
 
+describe('host: open floor in a group (the target scenario)', () => {
+  test('unnamed questions after «кто хочет добавить?» stay with colleagues; by name or «ты» right after her line they are hers', async () => {
+    const script = (trigger) => (trigger === 'question_to_host' ? { why: '', action: 'answer', to: null, text: 'Да, завтра как обычно.', plan: null } : null);
+    const h = makeHost({ present: ['Тимур Ткач', 'Глеб Невский', 'Ярослав Орлов'], brainScript: script });
+    await h.ready();
+    h.host._test.beginRound('tkach_t');
+    h.host.state.setPlan({ next: null, then: [] });
+    for (const id of ['nevsky_g', 'orlov_y']) h.host.state.setStatus(id, 'spoke');
+    await h.host._test.run(() => h.host._test.endTurnSequence('closer'));
+    await h.settle(400);
+    assert.equal(h.find('round.open_floor_asked').length, 1);
+    h.ears.emit('stt_final', { item_id: 'g1', text: 'а кто сегодня дежурит', t: h.t.now, t_speech_start: h.t.now - 1500, t_speech_end: h.t.now });
+    h.ears.emit('stt_final', { item_id: 'g2', text: 'а тут кто то есть кроме нас', t: h.t.now, t_speech_start: h.t.now - 1500, t_speech_end: h.t.now });
+    await h.settle(300);
+    assert.equal(h.find('host.question').length, 0, 'a group question without her name is for the colleagues');
+    h.ears.emit('stt_final', { item_id: 'g3', text: 'Кора, а завтра стендап будет', t: h.t.now, t_speech_start: h.t.now - 1500, t_speech_end: h.t.now });
+    await h.settle(300);
+    assert.equal(h.find('host.question')[0]?.how, 'name');
+    await h.advance(3000, QUIET);
+    h.ears.emit('stt_final', { item_id: 'g4', text: 'а ты во сколько начнёшь', t: h.t.now, t_speech_start: h.t.now - 1500, t_speech_end: h.t.now });
+    await h.settle(300);
+    assert.equal(h.find('host.question')[1]?.how, 'after_own_utterance');
+    await h.finish();
+  });
+
+  test('a line cut off by a barge-in may be said again; a completed one is not repeated for 30 s', async () => {
+    const h = makeHost({ present: ['Тимур Ткач', 'Глеб Невский', 'Ярослав Орлов'], onDemand: true });
+    await h.ready();
+    h.player.auto = 0; // playbacks end only when the test says so
+    const line = { why: '', action: 'speak', to: null, text: 'Коллеги, кто хочет что-то добавить или спросить?', plan: null };
+    await h.host._test.applyAction(line, 'silence');
+    await h.advance(500, QUIET);
+    const first = h.player.current();
+    assert.equal(first?.meta.text, line.text);
+    await first.abort('barge_in');
+    await h.advance(12_000, QUIET);
+    await h.host._test.applyAction(line, 'silence');
+    await h.advance(500, QUIET);
+    assert.ok(!h.find('host.action_ignored').some((e) => e.reason === 'duplicate'), 'cut off: she may ask again');
+    const second = h.player.current();
+    assert.equal(second?.meta.text, line.text);
+    second.complete();
+    await h.advance(12_000, QUIET);
+    await h.host._test.applyAction(line, 'silence');
+    await h.settle(100);
+    assert.ok(h.find('host.action_ignored').some((e) => e.reason === 'duplicate'), 'said to the end 12 s ago: not again');
+    await h.finish();
+  });
+});
+
 describe('host: on-demand mode (no schedule)', () => {
   test('--max-minutes: farewell to people in the room, silent exit from an empty one', async () => {
     const empty = makeHost({ present: [], onDemand: true, flags: { maxMinutes: 0.02 } });

@@ -72,6 +72,8 @@ const BRAIN_ON_BARGE_KINDS = new Set(['answer', 'speak', 'greeting', 'proposal']
 const COST = Object.freeze({ usd_rub: 90, realtime_audio_in_per_m: 32, realtime_audio_out_per_m: 64, realtime_text_in_per_m: 4, realtime_text_out_per_m: 16, transcribe_per_min: 0.006 });
 const BLOCKER_RE = /(?:^|[^\p{L}])(?:блокер|блокир|застрял|мешает|проблем|риск|не могу|не получается|не успева|тормозит|горит|нужна помощь|нужна поддержка|стопор)/iu;
 const QUESTION_RE = /\?\s*$|^(?:а\s+|и\s+|ну\s+|слушай[, ]+)?(?:кто|что|чего|как|какой|какая|какие|какое|почему|зачем|где|когда|откуда|куда|сколько|чем|чей|можешь|умеешь|расскажи|скажи)(?![\p{L}])/iu;
+// STT gives no «?»: a question word among the first four words, not the indefinite «кто-то / что-нибудь»
+const QUESTION_NEAR_START_RE = /^(?:\S+\s+){0,3}(?:кто|что|чего|как|какой|какая|какие|какое|почему|зачем|где|когда|откуда|куда|сколько|чем|чей|можешь|умеешь|расскажи|скажи)(?![\p{L}])(?![\s-]+(?:то|нибудь|либо)(?![\p{L}]))/iu;
 const YOU_RE = /(?:^|[^\p{L}])(?:ты|тебя|тебе|тобой|твой|твоя|твоё|твое|твои)(?![\p{L}])/iu;
 const AI_RE = /(?:^|[^\p{L}])(?:ии|искусствен|нейросет|бот|робот|модель|ведущ|алгоритм|нейронк|железяк)/iu;
 /** Words of a «nothing to add» reply to her open-floor question. */
@@ -363,10 +365,11 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     return buildContext(snap, { windowSec: 45, maxEvents: 20, maxTokens: 2500, leadId: state.firstAlways });
   }
 
+  /** Said within RECENT_SAID_MS, or said to the end within `ms` (a line cut off by a barge-in may be asked again). */
   function recentlySaid(text, ms = RECENT_SAID_MS) {
     const t = wall();
     flow.recentSaid = flow.recentSaid.filter((r) => t - r.at <= RECENT_SAID_KEEP_MS);
-    return flow.recentSaid.some((r) => t - r.at <= ms && sameLine(text, r.text));
+    return flow.recentSaid.some((r) => (t - r.at <= RECENT_SAID_MS || (r.completed && t - r.at <= ms)) && sameLine(text, r.text));
   }
 
   // ------------------------------------------------------------------------------------ speech
@@ -455,7 +458,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
       if (allowed.reason === 'shadow') {
         hostState.last_utterance = text;
         flow.lastSpokenAt = wall();
-        flow.recentSaid.push({ text, at: wall() });
+        flow.recentSaid.push({ text, at: wall(), completed: true });
         return { status: 'shadow', text, played_ratio: 1 };
       }
       return { status: 'suppressed', reason: allowed.reason, text, played_ratio: 0 };
@@ -491,7 +494,8 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     }
     hostState.speaking = true;
     floor.setHostSpeaking(true, { t: wall() });
-    flow.recentSaid.push({ text, at: wall() });
+    const said = { text, at: wall(), completed: false };
+    flow.recentSaid.push(said);
     const meta = { key: spec.key ?? null, person: spec.person ?? null, kind: spec.kind ?? (spec.key ? 'clip' : 'live'), text, wait_ms: waitMs, ...(spec.meta ?? {}) };
     ev('speech.start', { source: clip ? 'clip' : 'live', key: spec.key ?? null, person: spec.person ?? null, kind: meta.kind, text, wait_ms: waitMs, duration_ms: clip?.duration_ms ?? null });
     let result;
@@ -512,6 +516,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     floor.setHostSpeaking(false, { t: wall() });
     hostState.last_utterance = text;
     hostState.last_interrupted = result.status === 'aborted';
+    said.completed = result.status === 'completed';
     if (result.status === 'completed') flow.lastSpokenAt = wall();
     ev(result.status === 'aborted' ? 'speech.abort' : 'speech.end', {
       status: result.status,
@@ -1182,10 +1187,12 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     // her «кто хочет добавить или спросить?» in a 1:1: whatever the one person says next is for her, unless it is
     // «нет, спасибо» (live 27.09: STT gives no «?», and «а тут кто-то есть кроме меня» went unanswered)
     if (state.phase === 'open_floor' && flow.openFloorAt !== null && present <= 1 && !foldWords(text).every((w) => NOTHING_TO_ADD.has(w))) return 'open_floor';
-    if (!looksLikeQuestion(text)) return null;
-    if (present <= 2) return 'small_group';
-    if (YOU_RE.test(text) && flow.lastSpokenAt && wall() - flow.lastSpokenAt < OWN_UTTERANCE_WINDOW_MS) return 'after_own_utterance';
-    if (AI_RE.test(text)) return 'about_ai';
+    const question = looksLikeQuestion(text);
+    if (question && present <= 2) return 'small_group';
+    // a group: «ты» right after her own line is to her, even with the question word further in («а ты во сколько начнёшь»)
+    const afterOwn = flow.lastSpokenAt && wall() - flow.lastSpokenAt < OWN_UTTERANCE_WINDOW_MS;
+    if (afterOwn && YOU_RE.test(text) && (question || QUESTION_NEAR_START_RE.test(text))) return 'after_own_utterance';
+    if (question && AI_RE.test(text)) return 'about_ai';
     return null;
   }
 
