@@ -530,6 +530,34 @@ describe('client: one decision', () => {
     assert.equal(events.find((e) => e.type === 'brain.action').text_ms, r.text_ms);
   });
 
+  test('why_last: schema, prompt, examples and repair put `why` after `text`; the line is out before `plan` and `why`', async () => {
+    const whyLast = { action: 'answer', to: null, text: 'Да, слышу!', plan: null, why: 'вопрос ко мне' };
+    const raw = JSON.stringify(whyLast);
+    const cut = raw.indexOf('"plan"');
+    const fetch = scriptedFetch([
+      () => sse([raw.slice(0, cut), raw.slice(cut)].map((p) => ({ choices: [{ delta: { content: p } }] })).concat([{ choices: [{ delta: {}, finish_reason: 'stop' }] }, '[DONE]']), { delayMs: 40 }),
+    ]);
+    const { brain, events } = brainWith({ fetch, brain: { why_last: true } });
+    const early = [];
+    const r = await brain.decide(CTX, { onText: (e) => early.push(e) });
+    assert.equal(r.status, 'ok');
+    assert.equal(r.action.why, 'вопрос ко мне');
+    assert.equal(early[0]?.text, 'Да, слышу!');
+    assert.ok(r.text_ms <= r.latency_ms - 30, `text ${r.text_ms} ms, total ${r.latency_ms} ms`);
+    const schema = fetch.calls[0].body.response_format.json_schema.schema;
+    assert.deepEqual(Object.keys(schema.properties), ['action', 'to', 'text', 'plan', 'why']);
+    assert.deepEqual([...schema.required].sort(), [...ACTION_JSON_SCHEMA.required].sort());
+    assert.equal(events.find((e) => e.type === 'brain.init').why_last, true);
+    const assets = loadBrainAssets();
+    const prompt = buildSystemPrompt({ ...assets, dayMode: 'daily_plans', whyLast: true });
+    assert.match(prompt, /\{"action": "…", "to": "…", "text": "…", "plan": \{"next": "…", "then": \["…"\]\}, "why": "…"\}/);
+    assert.match(prompt, /- why: последним ключом/);
+    assert.equal((prompt.match(/- why:/g) ?? []).length, 1);
+    assert.ok(!/Ответ: \{"why"/.test(prompt), 'examples answer with why last');
+    assert.match(prompt, /Ответ: \{"action"/);
+    assert.match(buildSystemPrompt({ ...assets, dayMode: 'daily_plans' }), /Ответ: \{"why"/, 'default stays why-first');
+  });
+
   test('onText: silent for wait, a null or invalid text, and without a listener', async () => {
     const cases = [
       GIVE,

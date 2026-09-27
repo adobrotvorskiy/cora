@@ -38,7 +38,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { dayMode as clockDayMode } from '../clock.js';
 import { selectBrainProvider } from '../config.js';
 import { hasKey, requireKey } from '../env.js';
-import { ACTION_JSON_SCHEMA, ACTION_SCHEMA_NAME, TEXT_LIMITS, completedFields, parseActionText, validate, waitAction } from './actions.js';
+import { ACTION_SCHEMA_NAME, TEXT_LIMITS, actionJsonSchema, actionKeys, completedFields, parseActionText, validate, waitAction } from './actions.js';
 import { estimateTokens } from './context.js';
 import { buildSystemPrompt, humanModelName, loadBrainAssets } from './prompt.js';
 
@@ -248,8 +248,10 @@ export function createBrain({
   const voiceVendorHuman = settings.voice?.provider === 'yandex_cascade' ? 'Яндекс SpeechKit' : 'OpenAI';
   // main.js sets settings.times only with --start; without it the meeting has no clock (on demand)
   const scheduled = Boolean(settings.times);
+  const whyLast = cfg.why_last === true;
+  const schema = actionJsonSchema({ whyLast });
   const promptFor = (model) =>
-    systemPrompt ?? buildSystemPrompt({ ...assets, dayMode: effectiveDayMode, brainModelHuman: humanModelName(model), voiceVendorHuman, scheduled });
+    systemPrompt ?? buildSystemPrompt({ ...assets, dayMode: effectiveDayMode, brainModelHuman: humanModelName(model), voiceVendorHuman, scheduled, whyLast });
 
   let active = primary;
   let apiKey = requireKey(active.keyName, env);
@@ -269,6 +271,7 @@ export function createBrain({
     fallback: fallback ? `${fallback.provider}/${fallback.model}` : null,
     day_mode: effectiveDayMode,
     schedule: scheduled ? 'scheduled' : 'on_demand',
+    ...(whyLast ? { why_last: true } : {}),
     prompt_sha1: promptHash,
     prompt_chars: prompt.length,
     prompt_tokens_est: estimateTokens(prompt),
@@ -496,7 +499,7 @@ export function createBrain({
       emit('brain.invalid', { job: job.id, attempt: attempts, errors: verdict.errors, raw: clip(r.content, 600), finish_reason: r.finish_reason });
       if (!repairTried) {
         repairTried = true;
-        messages = [...base(), { role: 'assistant', content: r.content || '(пустой ответ)' }, { role: 'user', content: repairPrompt(verdict.errors) }];
+        messages = [...base(), { role: 'assistant', content: r.content || '(пустой ответ)' }, { role: 'user', content: repairPrompt(verdict.errors, whyLast) }];
         continue;
       }
       return finish(job, t0, queueMs, { status: 'invalid', action: waitAction('invalid_brain_output'), errors: verdict.errors, usage, attempts, ttft, textMs, last });
@@ -605,7 +608,7 @@ export function createBrain({
   function buildBody(messages, tokenFactor) {
     const body = { model: active.model, messages };
     if (caps.format === 'json_schema') {
-      body.response_format = { type: 'json_schema', json_schema: { name: ACTION_SCHEMA_NAME, strict: true, schema: ACTION_JSON_SCHEMA } };
+      body.response_format = { type: 'json_schema', json_schema: { name: ACTION_SCHEMA_NAME, strict: true, schema } };
     } else if (caps.format === 'json_object') {
       body.response_format = { type: 'json_object' };
     }
@@ -909,8 +912,9 @@ function retryAfter(headers) {
   return Number.isFinite(s) && s > 0 ? s * 1000 : null;
 }
 
-function repairPrompt(errors) {
-  return `Ответ не прошёл проверку: ${errors.join('; ')}. Верни исправленный ответ: ровно один JSON-объект {"why","action","to","text","plan"} по контракту, без пояснений.`;
+function repairPrompt(errors, whyLast = false) {
+  const keys = actionKeys({ whyLast }).map((k) => `"${k}"`).join(',');
+  return `Ответ не прошёл проверку: ${errors.join('; ')}. Верни исправленный ответ: ровно один JSON-объект {${keys}} по контракту, без пояснений.`;
 }
 
 function normalizeUsage(u) {

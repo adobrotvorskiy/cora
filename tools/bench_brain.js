@@ -4,11 +4,12 @@
 //   node tools/bench_brain.js [--provider openai|openrouter|yandex|all] [--models a,b,...] [--day mon|tue]
 //                             [--rounds N] [--no-warmup] [--timeout MS] [--verbose]
 //                             [--or-route JSON] [--cache-control on|off] [--effort LEVEL|off]
-//                             [--format json_schema|json_object|none]
+//                             [--format json_schema|json_object|none] [--why-last]
 // --or-route sets settings.brain.openrouter_provider (OpenRouter routing, e.g.
 // '{"order":["google-ai-studio"],"allow_fallbacks":true}' or '{"sort":"latency"}');
 // --cache-control forces the explicit cache breakpoint on the system prompt (OpenRouter);
-// --effort sets the reasoning effort (OpenAI reasoning_effort / OpenRouter reasoning.effort).
+// --effort sets the reasoning effort (OpenAI reasoning_effort / OpenRouter reasoning.effort);
+// --why-last sets settings.brain.why_last (`why` after `text`: compare decisions and the text column).
 //
 // Candidates: OpenAI direct (key named by settings.keys.openai) and OpenRouter (key named by
 // settings.keys.openrouter, e.g. Cora_KEY). The shared OPENROUTER_API_KEY is never used; key
@@ -41,7 +42,7 @@ const SKIP_KINDS = new Set(['model_unavailable', 'auth', 'payment', 'bad_request
 const USAGE = `Usage: node tools/bench_brain.js [--provider openai|openrouter|yandex|all] [--models a,b] [--day mon|tue]
                                [--rounds N] [--no-warmup] [--timeout MS] [--verbose]
                                [--or-route JSON] [--cache-control on|off] [--effort LEVEL|off]
-                               [--format json_schema|json_object|none]`;
+                               [--format json_schema|json_object|none] [--why-last]`;
 
 async function main() {
   const { values } = parseArgs({
@@ -57,6 +58,7 @@ async function main() {
       'cache-control': { type: 'string' },
       effort: { type: 'string' },
       format: { type: 'string' },
+      'why-last': { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
     },
   });
@@ -72,6 +74,7 @@ async function main() {
   if (values['or-route']) overrides.openrouter_provider = JSON.parse(values['or-route']);
   if (values['cache-control']) overrides.cache_control = values['cache-control'] === 'on';
   if (values.format) overrides.response_format = values.format;
+  if (values['why-last']) overrides.why_last = true;
   if (values.effort) {
     overrides.reasoning_effort = values.effort === 'off' ? null : values.effort;
     overrides.openrouter_reasoning = values.effort === 'off' ? null : { effort: values.effort };

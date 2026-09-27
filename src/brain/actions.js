@@ -71,6 +71,28 @@ export const ACTION_JSON_SCHEMA = deepFreeze({
   },
 });
 
+/**
+ * Key order of the output. settings.brain.why_last puts `why` at the end: `text` then closes earlier in
+ * the stream and the host starts synthesizing it sooner (27.09: with `why` first `text` closed only
+ * 2–20 ms before the end). Why-first may decide better: compare with tools/bench_brain.js --why-last.
+ */
+export function actionKeys({ whyLast = false } = {}) {
+  return whyLast ? ['action', 'to', 'text', 'plan', 'why'] : [...ACTION_KEYS];
+}
+
+/** ACTION_JSON_SCHEMA with the properties in actionKeys() order (structured outputs follow it). */
+export function actionJsonSchema({ whyLast = false } = {}) {
+  if (!whyLast) return ACTION_JSON_SCHEMA;
+  const keys = actionKeys({ whyLast });
+  return deepFreeze({ ...ACTION_JSON_SCHEMA, required: keys, properties: Object.fromEntries(keys.map((k) => [k, ACTION_JSON_SCHEMA.properties[k]])) });
+}
+
+/** The same action with its keys in actionKeys() order (prompt examples). */
+export function orderActionKeys(action, opts) {
+  const keys = actionKeys(opts);
+  return Object.fromEntries([...keys.filter((k) => k in action).map((k) => [k, action[k]]), ...Object.entries(action).filter(([k]) => !keys.includes(k))]);
+}
+
 /** A no-op action; `why` says why nothing happens (e.g. 'invalid_brain_output'). */
 export function waitAction(why = '') {
   return { why, action: 'wait', to: null, text: null, plan: null };
