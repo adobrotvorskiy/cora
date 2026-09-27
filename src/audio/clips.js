@@ -497,6 +497,7 @@ export class ClipStore {
     this._logger = log;
     this._random = random;
     this._last = new Map(); // phrase key -> last variant index
+    this._rendering = new Map(); // clip hash -> in-flight render (concurrent ensure() calls share it)
     this._present = null; // Set of ids (setPresent)
     this._stats = { hits: 0, misses: 0, not_applicable: 0, rendered: 0, render_failed: 0 };
   }
@@ -733,13 +734,35 @@ export class ClipStore {
     let next = 0;
     let done = 0;
     let streak = 0;
+    let shared = 0;
     const stopped = () => stats.fatal || signal?.aborted;
+    const renderOnce = async (entry) => {
+      // the host warms the core set and the people in the room at once: one render per clip, not two
+      const other = this._rendering.get(entry.hash);
+      if (other) {
+        await other.catch(() => {});
+        const file = join(dir, `${entry.hash}.pcm`);
+        if (existsSync(file)) {
+          shared++;
+          stats.cached++;
+          stats.audio_ms += fileAudioMs(file);
+          return { status: 'cached' };
+        }
+      }
+      const p = this._renderOne(entry, dir, identity, stats, { keepMismatch, retries, stopped });
+      this._rendering.set(entry.hash, p);
+      try {
+        return await p;
+      } finally {
+        if (this._rendering.get(entry.hash) === p) this._rendering.delete(entry.hash);
+      }
+    };
     const worker = async () => {
       while (!stopped() && next < todo.length) {
         const entry = todo[next++];
-        const res = await this._renderOne(entry, dir, identity, stats, { keepMismatch, retries, stopped });
+        const res = await renderOnce(entry);
         done++;
-        if (res.status === 'rendered') streak = 0;
+        if (res.status === 'rendered' || res.status === 'cached') streak = 0;
         else if (res.status !== 'skipped') streak++;
         if (!stats.fatal && streak >= this.opts.maxConsecutiveFailures) {
           stats.fatal = { code: 'too_many_failures', message: `${streak} clips in a row failed; last: ${res.error?.code ?? res.status}` };
@@ -755,7 +778,7 @@ export class ClipStore {
       }
     };
     if (!stats.fatal) await Promise.all(Array.from({ length: Math.max(1, Math.min(concurrency, todo.length)) }, worker));
-    stats.skipped = todo.length - stats.rendered - stats.failed - stats.mismatched;
+    stats.skipped = todo.length - stats.rendered - stats.failed - stats.mismatched - shared;
     const u = stats.usage;
     if (u.priced && u.priced === u.responses) {
       stats.cost_usd = round6(u.cost_usd);

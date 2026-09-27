@@ -494,3 +494,27 @@ test('warmup cost with the SpeechKit mouth: per 250-character request, not the O
   assert.equal(again.rendered, 0);
   assert.equal(again.cost_usd, 0, 'cached clips cost nothing');
 });
+
+test('concurrent warmups (core set + people in the room) render each clip once', async () => {
+  const mouth = fakeMouth({ delayMs: 15 });
+  const s = store({ mouth });
+  const [a, b] = await Promise.all([s.warmup({ keys: ['greet', 'sorry_continue'], surnames: false }), s.warmup({ keys: ['greet', 'handoff'], present: ['tkach_t'], surnames: false })]);
+  const texts = mouth.calls.map((c) => c.text);
+  assert.equal(new Set(texts).size, texts.length, `rendered twice: ${texts}`);
+  assert.equal(a.rendered + b.rendered, texts.length);
+  assert.equal(a.skipped + b.skipped, 0);
+  assert.ok(a.cached + b.cached >= 2, 'the shared greet variants count as cached for the second warmup');
+});
+
+test('SpeechKit / ElevenLabs mouths key the clip cache by their own voice, not the settings OpenAI voice', async () => {
+  const yandex = (tts) => new ClipStore({ phrases: PHRASES, people: PEOPLE, mouth: createYandexMouth({ apiKey: 'k', tts }), cacheDir: tmpCache(), settings: { voice: { provider: 'yandex_cascade' } } });
+  const alena = yandex({ voice: 'alena', role: 'good', speed: 1.1 });
+  assert.deepEqual([alena.identity.provider, alena.identity.model, alena.identity.voice], ['yandex_tts', 'speechkit-tts-v3', 'alena']);
+  assert.notEqual(alena.hash('Доброе утро!'), yandex({ voice: 'marina' }).hash('Доброе утро!'));
+  assert.notEqual(alena.hash('Доброе утро!'), yandex({ voice: 'alena', role: 'good', speed: 1.0 }).hash('Доброе утро!'));
+  const { ElevenMouth } = await import('../../src/audio/eleven_mouth.js');
+  const eleven = new ClipStore({ phrases: PHRASES, people: PEOPLE, mouth: new ElevenMouth({ apiKey: 'k', voiceId: 'voice123' }), cacheDir: tmpCache() });
+  assert.equal(eleven.identity.provider, 'elevenlabs');
+  assert.equal(eleven.identity.voice, 'voice123');
+  assert.notEqual(eleven.hash('Доброе утро!'), alena.hash('Доброе утро!'));
+});

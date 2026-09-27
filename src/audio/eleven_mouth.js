@@ -51,6 +51,10 @@ export class ElevenMouth extends EventEmitter {
   get cacheKey() {
     return `elevenlabs|${this._model}|${this._voiceId}|${createHash('sha1').update(this._instructions).digest('hex').slice(0, 12)}`;
   }
+  /** Clip cache identity (clips.js identityFromMouth): without it the cache fell back to the settings' OpenAI voice. */
+  get identity() {
+    return { provider: 'elevenlabs', model: this._model, voice: this._voiceId, instructions: this.instructions };
+  }
 
   /**
    * Say `text` verbatim, streaming audio to onAudio (base64 PCM16 24 kHz) as it arrives.

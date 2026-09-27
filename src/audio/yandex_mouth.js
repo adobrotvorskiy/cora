@@ -82,6 +82,10 @@ export class YandexMouth extends EventEmitter {
   get cacheKey() {
     return `yandex_tts|${sha1(this.instructions).slice(0, 12)}`;
   }
+  /** Clip cache identity (clips.js identityFromMouth): another voice, role or speed is another cache. */
+  get identity() {
+    return { provider: 'yandex_tts', model: 'speechkit-tts-v3', voice: this._tts.voice, instructions: this.instructions };
+  }
 
   /**
    * Say `text` verbatim; audio goes to onAudio as base64 PCM16 24 kHz (or Buffer with format 'buffer').
