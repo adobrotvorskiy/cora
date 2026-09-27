@@ -68,19 +68,30 @@ describe('actions: schema, validation, normalization', () => {
     const v = validate({ ...GIVE, plan: { next: 'orlov_y', then: ['orlov_y', 'nevsky_g', 'ghost', 'nevsky_g'] } }, { participants: PARTICIPANTS });
     assert.equal(v.ok, true, v.errors.join('; '));
     assert.deepEqual(v.action, { why: 'Тимур закончил', action: 'give_word', to: 'nevsky_g', text: null, plan: { next: 'orlov_y', then: ['nevsky_g'] } });
-    assert.ok(v.warnings.some((w) => w.includes('"ghost" dropped')));
+    assert.ok(v.warnings.some((w) => /"ghost".*dropped/.test(w)));
   });
 
-  test('errors: unknown/absent/missing "to", missing text, bad action, unknown plan.next, English', () => {
+  test('errors: unknown/absent/missing "to", missing text, bad action, English', () => {
     const errs = (raw) => validate(raw, { participants: PARTICIPANTS }).errors.join(' | ');
     assert.match(errs({ ...GIVE, to: 'timur_x' }), /to "timur_x" is not a participant id; use one of: orlov_y, tkach_t/);
     assert.match(errs({ ...GIVE, to: null }), /give_word needs "to"/);
     assert.match(errs({ ...GIVE, to: 'belozerskaya_n' }), /not in the meeting/);
     assert.match(errs({ why: '', action: 'speak', to: null, text: '  ', plan: null }), /speak needs non-empty "text"/);
     assert.match(errs({ why: '', action: 'dance', to: null, text: null, plan: null }), /action must be one of/);
-    assert.match(errs({ ...GIVE, plan: { next: 'nobody', then: [] } }), /plan\.next "nobody"/);
     assert.match(errs({ why: '', action: 'answer', to: null, text: 'Sure, I am the host of this meeting, let me continue.', plan: null }), /Russian/);
     assert.equal(validate('nope').ok, false);
+  });
+
+  test('plan with absent roster people: dropped with a warning, no repair round-trip', () => {
+    const v = (plan) => validate({ ...GIVE, plan }, { participants: PARTICIPANTS });
+    const allAbsent = v({ next: 'smirnov_x', then: ['kuznetsova_y', 'belozerskaya_n'] });
+    assert.equal(allAbsent.ok, true);
+    assert.equal(allAbsent.action.plan, null, 'nothing valid left: the host keeps its plan');
+    assert.ok(allAbsent.warnings.some((w) => w.includes('plan.next "smirnov_x"')));
+    const mixed = v({ next: 'smirnov_x', then: ['kuznetsova_y', 'tkach_t', 'orlov_y'] });
+    assert.equal(mixed.ok, true);
+    assert.deepEqual(mixed.action.plan, { next: 'tkach_t', then: ['orlov_y'] }, 'the first present one moves up');
+    assert.deepEqual(v({ next: null, then: [] }).action.plan, { next: null, then: [] }, 'an explicit empty plan stays');
   });
 
   test('names map to ids; wait drops text; unknown keys are dropped', () => {

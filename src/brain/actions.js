@@ -22,7 +22,8 @@
 // handoff clip for it without asking the brain); plan.then = the rest of the queue, in order.
 //
 // validate() = shape check + normalization. Ids are resolved against the context's
-// participants (a display name maps to its id; unknown ids are errors). Text is sanitized
+// participants (a display name maps to its id; an unknown `to` is an error, unknown plan ids are
+// dropped with a warning: the model plans from the whole roster, absent people included). Text is sanitized
 // (URLs, e-mails, IPs, key-like tokens, markdown, emoji and "..." pauses removed; masculine
 // self-reference such as «я понял» fixed) and trimmed to the limits at a sentence boundary.
 // Errors make client.js do one repair round-trip; warnings only go to the log.
@@ -229,10 +230,20 @@ export function validate(raw, { participants = [], context = null, limits = {} }
       errors.push('plan must be {"next": id|null, "then": [ids]} or null');
       plan = null;
     } else {
+      // live 27.09: the model put absent roster people into the plan; a repair round-trip cost 1.4 s or
+      // the whole decision. Unknown and absent ids are dropped with a warning instead.
+      const planId = (value) => {
+        const id = typeof value === 'string' ? resolveId(value, people) : null;
+        return id && byId.get(id)?.present !== false ? id : null;
+      };
       let next = plan.next === undefined || plan.next === '' ? null : plan.next;
+      let dropped = 0;
       if (next !== null) {
-        const id = typeof next === 'string' ? resolveId(next, people) : null;
-        if (!id) errors.push(`plan.next ${JSON.stringify(next)} is not a participant id; use one of: ${knownIds()}`);
+        const id = planId(next);
+        if (!id) {
+          warnings.push(`plan.next ${JSON.stringify(next)} is not a present participant: dropped`);
+          dropped++;
+        }
         next = id;
       }
       let then = plan.then ?? [];
@@ -243,16 +254,19 @@ export function validate(raw, { participants = [], context = null, limits = {} }
       const seen = new Set(next ? [next] : []);
       const queue = [];
       for (const item of then) {
-        const id = typeof item === 'string' ? resolveId(item, people) : null;
+        const id = planId(item);
         if (!id) {
-          warnings.push(`plan.then: unknown id ${JSON.stringify(item)} dropped`);
+          warnings.push(`plan.then: ${JSON.stringify(item)} is not a present participant: dropped`);
+          dropped++;
           continue;
         }
         if (seen.has(id)) continue;
         seen.add(id);
         queue.push(id);
       }
-      plan = { next, then: queue };
+      if (!next && queue.length && dropped) next = queue.shift();
+      // nothing valid left of a plan that named people: keep the host's plan (null = unchanged), not an empty one
+      plan = dropped && !next ? null : { next, then: queue };
     }
   }
 
