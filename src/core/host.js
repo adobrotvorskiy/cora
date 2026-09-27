@@ -36,6 +36,7 @@ import { launchBrowser } from '../browser/launch.js';
 import { attachPageAudio, serveAssets } from '../browser/page_inject.js';
 import * as telemost from '../browser/telemost.js';
 import { buildContext } from '../brain/context.js';
+import { SlotRecorder } from '../audio/slot_recorder.js';
 import { sendAlert } from '../ops/telegram.js';
 import { createAttribution } from './attribution.js';
 import { loadClips, loadPlayer, loadVoice, NO_VOICE_KIND } from './deps.js';
@@ -193,6 +194,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     loadPlayer,
     loadClips,
     createBrain: null,
+    SlotRecorder,
     sendAlert,
     roster: null,
     sttFixes: null,
@@ -240,6 +242,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
   let player = null;
   let clips = null;
   let brain = null;
+  let recorder = null; // --record: PCM per slot for tuning STT / Smart Turn (test rooms only)
   let stopObservers = null;
   let tickTimer = null;
   let domPollTimer = null;
@@ -1232,6 +1235,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
 
   function onSttDelta(d) {
     const soFar = fixText(d.so_far ?? d.text ?? '');
+    if (recorder && d.track_id) ev('stt.partial', { track: d.track_id.slice(0, 8), text: soFar, t: d.t ?? wall() });
     if (cascade && d.track_id && !isOwnEcho(soFar, saidRecently())) {
       speechActivity(d.track_id, d.t ?? wall());
       if (hostState.speaking && interruptsHost(soFar, saidRecently())) {
@@ -1297,6 +1301,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
         text,
         ...(text !== (f.text ?? '') ? { raw: f.text } : {}),
         ...(f.track_id ? { track: f.track_id.slice(0, 8), via: who.via, ...(who.alt?.length ? { alt: who.alt } : {}), stt_ms: f.latency_ms ?? null } : {}),
+        ...(f.t_speech_start != null ? { t0: f.t_speech_start, t1: f.t_speech_end ?? null } : {}),
       });
       if (quiet && !kill && !quietHit) {
         quiet = false; // a final line addressed to her by name: she is back (not the quiet phrase itself)
@@ -1592,11 +1597,31 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
 
     const avatar = avatarOpts();
     if (avatar?.mode === 'segments') await D.serveAssets(page, { prefix: '/__host_assets/', dir: `${APP_ROOT}/assets/live` });
+    if (flags.record) {
+      if (flags.live || gate.reason !== 'not the real room') ev('record.refused', { reason: 'real room: recording is for test rooms only' });
+      else {
+        const dir = typeof flags.record === 'string' ? flags.record : join(APP_ROOT, '_internal', `rec_${clock.formatMsk(new Date(), 'YYYY-MM-DD_HH-mm-ss')}`);
+        recorder = new D.SlotRecorder({ dir, now: wall });
+        ev('record.start', { dir });
+      }
+    }
+    const cascadeEars = voice?.kind === 'yandex_cascade';
     audio = await D.attachPageAudio(page, {
       onAudio: onAudioChunk,
       onEvent: onPageEvent,
       // yandex_cascade: каждый трек — своя сессия STT (диаризация); для прочих провайдеров не используется
-      onTrackAudio: voice?.kind === 'yandex_cascade' ? (pcm, trackId) => voice?.ears?.pushAudio?.(pcm, trackId) : undefined,
+      onTrackAudio:
+        cascadeEars || recorder
+          ? (pcm, trackId) => {
+              if (cascadeEars) voice?.ears?.pushAudio?.(pcm, trackId);
+              try {
+                recorder?.write(trackId, pcm);
+              } catch (e) {
+                ev('record.error', { message: e?.message ?? String(e) });
+                recorder = null;
+              }
+            }
+          : undefined,
       opts: { avatar },
       baseDir: APP_ROOT,
     });
@@ -1703,6 +1728,14 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
       // page may be gone
     }
     if (voice) await voice.close().catch(() => {});
+    if (recorder) {
+      try {
+        const idx = recorder.close();
+        ev('record.done', { dir: idx.dir, tracks: Object.keys(idx.tracks).length, seconds: Object.values(idx.tracks).map((x) => x.seconds) });
+      } catch (e) {
+        ev('record.error', { message: e?.message ?? String(e) });
+      }
+    }
     brain?.close?.();
     if (browser) await Promise.race([browser.close(), sleep(CLOSE_TIMEOUT_MS)]).catch(() => {});
     costSummary(reason);

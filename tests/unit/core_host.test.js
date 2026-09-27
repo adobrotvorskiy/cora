@@ -898,3 +898,77 @@ describe('host: on-demand mode (no schedule)', () => {
     await h.finish();
   });
 });
+
+describe('host: --record (slot recording for STT / Smart Turn tuning)', () => {
+  function recordingDeps() {
+    const got = { writes: [], dirs: [], closed: 0, onTrackAudio: null };
+    class FakeRecorder {
+      constructor({ dir }) {
+        got.dirs.push(dir);
+      }
+      write(trackId, pcm) {
+        got.writes.push({ trackId, n: pcm.length });
+      }
+      close() {
+        got.closed++;
+        return { dir: got.dirs[0], tracks: { a: { seconds: 1 } } };
+      }
+    }
+    const deps = {
+      SlotRecorder: FakeRecorder,
+      attachPageAudio: async (page, o) => {
+        got.onTrackAudio = o.onTrackAudio ?? null;
+        return { play: async () => ({}), playEnd: async () => ({}), flush: async () => ({ played_ms: 0, dropped_ms: 0 }) };
+      },
+    };
+    return { got, deps };
+  }
+
+  test('test room: every slot chunk goes to the recorder, closed on exit', async () => {
+    const { got, deps } = recordingDeps();
+    const h = makeHost({ present: ['Тимур Ткач'], flags: { record: '/tmp/rec_test' }, deps });
+    await h.ready();
+    assert.equal(h.find('record.start').length, 1);
+    assert.deepEqual(got.dirs, ['/tmp/rec_test']);
+    assert.equal(typeof got.onTrackAudio, 'function', 'per-slot audio is taken even without cascade ears');
+    got.onTrackAudio(new Int16Array(2400), 'slot-1');
+    got.onTrackAudio(new Int16Array(2400), 'slot-2');
+    assert.deepEqual(got.writes, [
+      { trackId: 'slot-1', n: 2400 },
+      { trackId: 'slot-2', n: 2400 },
+    ]);
+    await h.finish();
+    assert.equal(got.closed, 1);
+    assert.equal(h.find('record.done')[0].tracks, 1);
+  });
+
+  test('--live: refused, nothing recorded', async () => {
+    const { got, deps } = recordingDeps();
+    const h = makeHost({ present: ['Тимур Ткач'], flags: { record: true, live: true, shadow: true }, deps });
+    await h.ready();
+    assert.equal(h.find('record.refused').length, 1);
+    assert.equal(h.find('record.start').length, 0);
+    assert.equal(got.dirs.length, 0);
+    assert.equal(got.onTrackAudio, null, 'no per-slot tap without cascade ears or a recorder');
+    await h.finish();
+  });
+
+  test('a failing recorder is dropped with record.error, the call goes on', async () => {
+    const { got, deps } = recordingDeps();
+    deps.SlotRecorder = class {
+      write() {
+        throw new Error('disk full');
+      }
+      close() {
+        return { dir: '', tracks: {} };
+      }
+    };
+    const h = makeHost({ present: ['Тимур Ткач'], flags: { record: '/tmp/rec_test' }, deps });
+    await h.ready();
+    got.onTrackAudio(new Int16Array(10), 'slot-1');
+    got.onTrackAudio(new Int16Array(10), 'slot-1');
+    assert.equal(h.find('record.error').length, 1);
+    await h.finish();
+    assert.equal(h.find('record.done').length, 0);
+  });
+});

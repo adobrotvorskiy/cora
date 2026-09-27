@@ -4,7 +4,9 @@
 // while the full JSONL goes to logs/. Never points at the real standup room.
 //
 //   node tools/run_testroom.js [--at 09:59] [--day mon|tue|wed|thu] [--start HH:MM] [--shadow] [--no-brain]
-//                              [--max-minutes 4] [--verbose] [--alert] [--url <another TEST url>]
+//                              [--max-minutes 4] [--verbose] [--alert] [--url <another TEST url>] [--record]
+// --record: PCM of every audio slot + STT partials and phrase times in the log, to _internal/rec_<time>/
+// (tuning SpeechKit and Smart Turn on real voices; with the consent of everyone in the room).
 //
 // Defaults: --at 09:59 (the start timer fires one minute after the join), --day = today if
 // Mon–Thu else mon, --max-minutes 4, Telegram alerts off (pass --alert to enable), timeline on.
@@ -37,13 +39,14 @@ const { values } = parseArgs({
     alert: { type: 'boolean', default: false },
     url: { type: 'string', default: testRoomUrl() ?? '' },
     provider: { type: 'string' },
+    record: { type: 'boolean', default: false },
     help: { type: 'boolean', short: 'h', default: false },
   },
   strict: true,
 });
 
 if (values.help) {
-  console.log(`node tools/run_testroom.js [--at HH:MM] [--day mon|tue|wed|thu] [--start HH:MM] [--shadow] [--no-brain] [--max-minutes N] [--verbose] [--alert] [--url <test url>] [--provider ${PROVIDERS.join('|')}]`);
+  console.log(`node tools/run_testroom.js [--at HH:MM] [--day mon|tue|wed|thu] [--start HH:MM] [--shadow] [--no-brain] [--max-minutes N] [--verbose] [--alert] [--url <test url>] [--provider ${PROVIDERS.join('|')}] [--record]`);
   process.exit(0);
 }
 if (values.provider && !PROVIDERS.includes(values.provider)) {
@@ -86,6 +89,7 @@ const flags = {
   at: values.at,
   day,
   start: values.start ?? null,
+  record: values.record,
 };
 
 const log = openLog({ name: 'testroom', verbose: values.verbose });
