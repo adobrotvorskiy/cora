@@ -691,6 +691,36 @@ describe('host: on-demand mode (no schedule)', () => {
     await h.finish();
   });
 
+  test('a start word without her name right after her own line is a reply to her; later it is not', async () => {
+    const script = (trigger) =>
+      trigger === 'question_to_host' ? { why: '', action: 'answer', to: null, text: 'Привет! Начну, когда попросят.', plan: null }
+      : trigger === 'start_requested' ? { why: '', action: 'give_word', to: 'tkach_t', text: 'Доброе утро! Тимур, начнёшь?', plan: null }
+      : null;
+    const h = makeHost({ present: ['Тимур Ткач'], brainScript: script, onDemand: true });
+    await h.ready();
+    h.ears.emit('stt_final', { item_id: 'r1', text: 'Кора, привет', t: h.t.now, t_speech_start: h.t.now - 800, t_speech_end: h.t.now });
+    await h.settle(300);
+    assert.equal(h.player.plays[0]?.meta.kind, 'answer');
+    await h.advance(5000, QUIET);
+    h.ears.emit('stt_final', { item_id: 'r2', text: 'да давай начнём стендап', t: h.t.now, t_speech_start: h.t.now - 1500, t_speech_end: h.t.now });
+    await h.settle(300);
+    assert.equal(h.find('host.start_requested')[0]?.how, 'reply');
+    assert.ok(h.brainCalls.some((c) => c.trigger === 'start_requested'));
+    assert.equal(h.host.phase, 'round');
+    await h.finish();
+
+    const late = makeHost({ present: ['Тимур Ткач'], brainScript: script, onDemand: true });
+    await late.ready();
+    late.ears.emit('stt_final', { item_id: 'r1', text: 'Кора, привет', t: late.t.now, t_speech_start: late.t.now - 800, t_speech_end: late.t.now });
+    await late.settle(300);
+    await late.advance(15_000, QUIET);
+    late.ears.emit('stt_final', { item_id: 'r2', text: 'ну что, начнём', t: late.t.now, t_speech_start: late.t.now - 1500, t_speech_end: late.t.now });
+    await late.settle(300);
+    assert.equal(late.find('host.start_requested').length, 0, 'long after her line: people talking among themselves');
+    assert.equal(late.host.phase, 'waiting');
+    await late.finish();
+  });
+
   test('scripted: a start word without her name does not open the standup', async () => {
     const h = makeHost({ present: ['Ярослав Орлов'], onDemand: true });
     await h.ready();

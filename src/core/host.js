@@ -41,7 +41,7 @@ import { createAttribution } from './attribution.js';
 import { loadClips, loadPlayer, loadVoice, NO_VOICE_KIND } from './deps.js';
 import { AsyncQueue, RingLog, Serializer, Transcript } from './events.js';
 import { createFloor } from './floor.js';
-import { createGuards, realRoomAllowed } from './guards.js';
+import { START_RE, createGuards, realRoomAllowed } from './guards.js';
 import { createState, loadRoster } from './state.js';
 
 const EXIT = Object.freeze({ ok: 0, error: 1, usage: 64, sigint: 130 });
@@ -65,6 +65,7 @@ const ACK_GAP_MS = 150;
 const SHORT_TURN_MS = 6000;
 const RECENT_SAID_MS = 10_000;
 const OWN_UTTERANCE_WINDOW_MS = 8000;
+const START_REPLY_WINDOW_MS = 12_000; // «давай начнём» without her name, this soon after her own line, is a reply to her
 const BRAIN_ON_BARGE_KINDS = new Set(['answer', 'speak', 'greeting', 'proposal']);
 const COST = Object.freeze({ usd_rub: 90, realtime_audio_in_per_m: 32, realtime_audio_out_per_m: 64, realtime_text_in_per_m: 4, realtime_text_out_per_m: 16, transcribe_per_min: 0.006 });
 const BLOCKER_RE = /(?:^|[^\p{L}])(?:блокер|блокир|застрял|мешает|проблем|риск|не могу|не получается|не успева|тормозит|горит|нужна помощь|нужна поддержка|стопор)/iu;
@@ -1219,12 +1220,15 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
         ev('host.quiet_lifted', { source: 'voice', text: text.slice(0, 120) });
       }
       if (kill || state.phase === 'silent' || state.phase === 'left') return;
-      const startReq = flow.startRequestedAt === null && !flow.roundStarted && guards.timerAt('start') === null && guards.isStartRequest(text);
-      if (startReq) {
+      const onDemandWaiting = flow.startRequestedAt === null && !flow.roundStarted && guards.timerAt('start') === null;
+      // live 27.09: «да давай начнём стендап» right after her «начну, когда попросят» went unheard for 12 s
+      const replyToHost = !hostState.speaking && flow.lastSpokenAt !== null && t - flow.lastSpokenAt <= START_REPLY_WINDOW_MS;
+      const startHow = !onDemandWaiting ? null : guards.isStartRequest(text) ? 'name' : replyToHost && START_RE.test(text) ? 'reply' : null;
+      if (startHow) {
         // on-demand mode (no schedule): «Кора, начинай» opens the standup
         flow.startRequestedAt = nowMs();
-        note('start_requested', { who: line.who, text: text.slice(0, 160) });
-        ev('host.start_requested', { who: line.who, text: text.slice(0, 160) });
+        note('start_requested', { who: line.who, text: text.slice(0, 160), how: startHow });
+        ev('host.start_requested', { who: line.who, how: startHow, text: text.slice(0, 160) });
         if (state.phase === 'waiting') state.setPhase('starting');
         if (brain) void think('start_requested', { priority: 'high' });
         else scriptedStart();
