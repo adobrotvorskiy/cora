@@ -1,8 +1,10 @@
 // Runs conversation scenarios (src/agent/scenarios.js) through any `decide(input) -> {actions}`.
 //
 //   const report = await runScenarios(SCENARIOS, decide, { rounds: 1 });
-//   report = {results: [{id, ok, soft, steps: [{i, ok, level, actions, why, ms}]}], must: {ok, total}, soft: {ok, total}}
+//   report = {results: [{id, ok, steps: [{i, ok, level, kind, actions, why, ms}]}], must: {ok, total}, soft: {ok, total}, violations}
 //
+// Every action is also checked against src/agent/invariants.js (the same list the host enforces);
+// a violation or a forbidden action fails the step and is counted in `violations`.
 // Teacher forcing: the conversation follows the script, not the agent's answers — her lines come
 // from her_line_done events, state changes from `state` events — so every step is checked in the
 // situation the scenario describes, whatever the agent said one step earlier.
@@ -53,32 +55,44 @@ export function matches(action, m) {
   return true;
 }
 
+import { violation } from './invariants.js';
+
 /** Actions that count as saying nothing. */
 const quiet = (actions) => actions.every((a) => a.action === 'skip');
 
 /**
- * Check one step's actions against its expectation.
- * @returns {{ok: boolean, why: string|null}}
+ * Check one step's actions: invariants (with a situation), forbidden actions, then the expectation.
+ * @param {object} step
+ * @param {object[]} actions
+ * @param {object} [sit]  {phase, speaker, queue, present} at decision time; enables the invariants
+ * @param {{leadId?: string|null}} [opts]
+ * @returns {{ok: boolean, why: string|null, kind: 'ok'|'violation'|'forbidden'|'expect'}}
  */
-export function checkStep(step, actions) {
+export function checkStep(step, actions, sit = null, { leadId = null } = {}) {
   const acts = (actions ?? []).filter((a) => a && a.action);
+  if (sit) {
+    for (const a of acts) {
+      const why = violation(a, sit, { leadId });
+      if (why) return { ok: false, kind: 'violation', why: `invariant ${why}: ${describe(a)}` };
+    }
+  }
   for (const m of step.forbid ?? []) {
     const hit = acts.find((a) => matches(a, m));
-    if (hit) return { ok: false, why: `forbidden ${describe(hit)}` };
+    if (hit) return { ok: false, kind: 'forbidden', why: `forbidden ${describe(hit)}` };
   }
   if (acts.some((a) => a.action === 'none' || a.action === 'unknown')) {
     const bad = acts.find((a) => a.action === 'none' || a.action === 'unknown');
-    return { ok: false, why: bad.action === 'none' ? `text instead of a tool call: «${bad.text}»` : `unknown tool ${bad.name}` };
+    return { ok: false, kind: 'expect', why: bad.action === 'none' ? `text instead of a tool call: «${bad.text}»` : `unknown tool ${bad.name}` };
   }
   for (const alt of step.expect ?? []) {
     if (alt.length === 0) {
-      if (quiet(acts)) return { ok: true, why: null };
+      if (quiet(acts)) return { ok: true, kind: 'ok', why: null };
       continue;
     }
-    if (alt.every((m) => acts.some((a) => matches(a, m)))) return { ok: true, why: null };
+    if (alt.every((m) => acts.some((a) => matches(a, m)))) return { ok: true, kind: 'ok', why: null };
   }
   const wanted = (step.expect ?? []).map((alt) => (alt.length ? alt.map(describeMatcher).join(' + ') : 'silence')).join(' | ');
-  return { ok: false, why: `got ${acts.length ? acts.map(describe).join(' + ') : 'nothing'}; expected ${wanted}` };
+  return { ok: false, kind: 'expect', why: `got ${acts.length ? acts.map(describe).join(' + ') : 'nothing'}; expected ${wanted}` };
 }
 
 /**
@@ -86,7 +100,7 @@ export function checkStep(step, actions) {
  * @param {(input: object) => Promise<{actions: object[], timings?: object}>} decide
  * @param {{rounds?: number, only?: string[], onStep?: Function, now?: () => number}} [opts]
  */
-export async function runScenarios(scenarios, decide, { rounds = 1, only = null, onStep = null, now = () => performance.now() } = {}) {
+export async function runScenarios(scenarios, decide, { rounds = 1, only = null, onStep = null, leadId = null, now = () => performance.now() } = {}) {
   const results = [];
   for (let r = 0; r < rounds; r++) {
     for (const sc of scenarios) {
@@ -114,8 +128,8 @@ export async function runScenarios(scenarios, decide, { rounds = 1, only = null,
           error = String(e?.message ?? e).slice(0, 300);
         }
         const level = step.level ?? sc.level ?? 'must';
-        const verdict = error ? { ok: false, why: `error: ${error}` } : checkStep(step, actions);
-        const rec = { i, ok: verdict.ok, level, actions, why: verdict.why, ms: Math.round(now() - t0), timings };
+        const verdict = error ? { ok: false, kind: 'error', why: `error: ${error}` } : checkStep(step, actions, input, { leadId });
+        const rec = { i, ok: verdict.ok, level, kind: verdict.kind, actions, why: verdict.why, ms: Math.round(now() - t0), timings };
         steps.push(rec);
         onStep?.(sc, rec);
       }
@@ -129,6 +143,7 @@ export async function runScenarios(scenarios, decide, { rounds = 1, only = null,
     results,
     must: { ok: must.filter((s) => s.ok).length, total: must.length },
     soft: { ok: soft.filter((s) => s.ok).length, total: soft.length },
+    violations: all.filter((s) => s.kind === 'violation' || s.kind === 'forbidden').length,
   };
 }
 

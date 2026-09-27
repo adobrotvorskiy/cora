@@ -1,0 +1,47 @@
+// What the agent may never do, whatever the model says (docs/agent_plan.md, «Остаётся в коде»).
+// One list for the scenario runner (a violation fails the step) and the agent host (a violation
+// rejects the call and the agent gets `rejected {tool, reason}` on its next wake).
+//
+//   violation(action, situation, {leadId}) -> null | reason
+//   situation = {phase, speaker, queue, present}
+
+/** «Тима, продолжай» after an answer (live 27.09, run 2): the host returns the floor itself. */
+export const NO_BRIDGE = /,\s*продолжа/i;
+/** Rules about herself the model made up (live 27.09, run 2). */
+export const INVENTED = /не отвечаю на вопросы|не вмешиваюсь|таковы правила|мне нельзя|мне запрещено/i;
+/** The text contract of the old brain: at most ~2 sentences / 220 chars. */
+export const MAX_TEXT_CHARS = 220;
+
+/**
+ * @param {{action: string, person?: string|null, text?: string|null}} a
+ * @param {{phase: string, speaker?: string|null, queue?: string[], present?: string[]}} sit
+ * @param {{leadId?: string|null}} [opts]
+ * @returns {string|null} why the action is not allowed
+ */
+export function violation(a, sit, { leadId = null } = {}) {
+  const present = new Set(sit.present ?? []);
+  const text = typeof a.text === 'string' ? a.text : '';
+  if (text) {
+    if (NO_BRIDGE.test(text)) return 'bridge';
+    if (INVENTED.test(text)) return 'invented_rule';
+    if (text.length > MAX_TEXT_CHARS) return 'too_long';
+  }
+  switch (a.action) {
+    case 'say':
+      return present.size ? null : 'empty_room';
+    case 'give_word':
+      if (!a.person || !present.has(a.person)) return 'not_present';
+      if (a.person === sit.speaker) return 'already_has_the_floor';
+      if (sit.phase === 'waiting' && leadId && present.has(leadId) && a.person !== leadId) return 'lead_goes_first';
+      return null;
+    case 'ask_done':
+      return sit.speaker && a.person === sit.speaker ? null : 'not_the_speaker';
+    case 'open_floor':
+      if (sit.phase !== 'round') return 'not_in_round';
+      return (sit.queue ?? []).some((id) => present.has(id) && id !== sit.speaker) ? 'queue_not_empty' : null;
+    case 'leave':
+      return sit.phase === 'open_floor' || !present.size ? null : 'round_not_finished';
+    default:
+      return null;
+  }
+}

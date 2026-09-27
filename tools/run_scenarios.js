@@ -3,7 +3,10 @@
 // agent (src/agent/draft_agent.js) on Yandex AI Studio with tool calls. Network; synthetic data only;
 // key values are never printed. Report: _internal/scenarios_<date>.json (gitignored).
 //
-//   node tools/run_scenarios.js [--model aliceai-llm-flash/latest] [--only id1,id2] [--rounds 2] [--verbose]
+//   node tools/run_scenarios.js [--model aliceai-llm-flash/latest] [--only id1,id2] [--rounds 3] [--verbose]
+//
+// Acceptance (docs/agent_plan.md, step 1): 0 violations (forbidden actions / invariants) and >= 90% of
+// the must-steps over 3 rounds (the model is stochastic).
 //        [--endpoint URL] [--folder ID]   (a mock / another folder)
 
 import { mkdirSync, writeFileSync } from 'node:fs';
@@ -22,7 +25,7 @@ async function main() {
     options: {
       model: { type: 'string' },
       only: { type: 'string' },
-      rounds: { type: 'string', default: '1' },
+      rounds: { type: 'string', default: '3' },
       verbose: { type: 'boolean', short: 'v', default: false },
       endpoint: { type: 'string' },
       folder: { type: 'string' },
@@ -53,6 +56,7 @@ async function main() {
   const report = await runScenarios(SCENARIOS, (input) => agent.decide(input), {
     rounds: Number(values.rounds),
     only,
+    leadId: SCENARIO_LEAD,
     onStep: (sc, s) => {
       if (current !== sc.id) {
         current = sc.id;
@@ -69,7 +73,9 @@ async function main() {
     const s = xs.filter((v) => v != null).sort((a, b) => a - b);
     return s.length ? s[Math.floor(s.length / 2)] : '-';
   };
-  console.log(`\nmust: ${report.must.ok}/${report.must.total}; soft: ${report.soft.ok}/${report.soft.total}; tool_choice ${agent.toolChoice}`);
+  const share = report.must.total ? Math.round((report.must.ok / report.must.total) * 100) : 0;
+  console.log(`\nmust: ${report.must.ok}/${report.must.total} (${share}%); soft: ${report.soft.ok}/${report.soft.total}; violations: ${report.violations}; tool_choice ${agent.toolChoice}`);
+  console.log(`acceptance (0 violations, >= 90% must): ${report.violations === 0 && share >= 90 ? 'PASS' : 'FAIL'}`);
   console.log(`tool name p50 ${p50(steps.map((s) => s.timings?.first_tool_name))} ms; whole answer p50 ${p50(steps.map((s) => s.timings?.done ?? s.ms))} ms`);
   const failed = report.results.filter((r) => !r.ok).map((r) => r.id);
   if (failed.length) console.log(`failed scenarios: ${failed.join(', ')}`);
@@ -78,7 +84,7 @@ async function main() {
   const path = join(dir, `scenarios_${formatMsk(new Date(), 'YYYY-MM-DD_HH-mm')}.json`);
   writeFileSync(path, JSON.stringify({ model, ...report }, (k, v) => (v instanceof RegExp ? String(v) : v), 2));
   console.log(`report: ${path}`);
-  return report.must.ok === report.must.total ? 0 : 1;
+  return report.violations === 0 && share >= 90 ? 0 : 1;
 }
 
 main().then(

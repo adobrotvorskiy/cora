@@ -5,12 +5,20 @@
 //
 // Scenario: {id, title, source, state: {phase, speaker, queue, present}, dialog: [{who, text}],
 //            steps: [{events, expect, forbid?, level?, ideal, note?}]}
-// Events: heard {who, text} · silence {ms} · joined / left {who} · her_line_done {text, cut?}
+// Events: heard {who, text} — as SpeechKit gives it after stt_fixes: lower case, no punctuation, «Кора»
+//         restored (heard() does it; heardRaw() keeps a text as written, e.g. a misheard name) ·
+//         silence {ms} · joined / left {who} · her_line_done {text, cut?}
 //         (what she said, scripted) · interrupted {text} · chorus {who: [...]} · state {phase?, speaker?, queue?}
 // expect: alternatives, any one is enough; an alternative = matchers that must all be met; [] (SILENT)
 //         = skip or nothing. forbid: matchers none may meet. level 'soft' = reported, never fails.
 // Matcher: {action: name | [names], person?: id | [ids], text?: RegExp (must match), notText?: RegExp}.
 // ideal: a good answer (documents the intent; the runner's own tests replay it).
+// Every action is also checked against the invariants of src/agent/invariants.js (the host enforces
+// the same list): a violation fails the step whatever `expect` says.
+// Silence ladder (docs/agent_plan.md): 1 s after a phrase — usually still early; 2.5 s — «всё?»;
+// 6 s after «всё?» — the turn is over.
+
+import { INVENTED, NO_BRIDGE } from './invariants.js';
 
 export const SCENARIO_ROSTER = Object.freeze([
   { id: 'orlov_y', display: 'Ярослав Орлов', vocative: 'Слава' },
@@ -25,14 +33,20 @@ const say = (text, notText) => ({ action: 'say', ...(text ? { text } : {}), ...(
 const give = (person, extra = {}) => ({ action: 'give_word', person, ...extra });
 const ask = (person) => ({ action: 'ask_done', person });
 const leave = () => ({ action: 'leave' });
-const heard = (who, text) => ({ type: 'heard', who, text });
+/** What STT + stt_fixes make of a phrase: lower case, no punctuation, «Кора» with a capital. */
+export function sttLike(text) {
+  return String(text)
+    .toLowerCase()
+    .replace(/[.,!?;:«»"()—–]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/(^|\s)кора(?=\s|$)/g, '$1Кора');
+}
+const heard = (who, text) => ({ type: 'heard', who, text: sttLike(text) });
+const heardRaw = (who, text) => ({ type: 'heard', who, text });
 const her = (text, cut = false) => ({ type: 'her_line_done', text, ...(cut ? { cut: true } : {}) });
 const silence = (ms) => ({ type: 'silence', ms });
 
-/** No «Тимур, продолжай» bridges after an answer (live 27.09, run 2). */
-const NO_BRIDGE = /,\s*продолжа/i;
-/** Invented rules about herself (live 27.09, run 2: «я не отвечаю на вопросы во время апдейтов»). */
-const INVENTED = /не отвечаю на вопросы|не вмешиваюсь|таковы правила|мне нельзя/i;
 const round = (speaker, queue, present = ['orlov_y', 'nevsky_g', 'tkach_t']) => ({ phase: 'round', speaker, queue, present });
 
 export const SCENARIOS = Object.freeze([
@@ -196,7 +210,7 @@ export const SCENARIOS = Object.freeze([
         ideal: [{ action: 'ask_done', person: 'tkach_t' }],
       },
       {
-        events: [her('Тима, всё?'), silence(4500)],
+        events: [her('Тима, всё?'), silence(6000)],
         expect: [[give('nevsky_g')]],
         ideal: [{ action: 'give_word', person: 'nevsky_g', text: '' }],
       },
@@ -271,6 +285,123 @@ export const SCENARIOS = Object.freeze([
     ],
   },
 
+  {
+    id: 'greet_misheard_name',
+    title: '«Кора» расслышали как «хара» (прогон 2): лучше ответить, но молчание не провал',
+    source: 'run2',
+    level: 'soft',
+    state: { phase: 'waiting', speaker: null, queue: [], present: ['tkach_t', 'nevsky_g'] },
+    steps: [
+      {
+        events: [heardRaw('nevsky_g', 'хара привет')],
+        expect: [[say()], SILENT],
+        forbid: [give(['tkach_t', 'nevsky_g'])],
+        ideal: [{ action: 'say', text: 'Привет, Глеб!' }],
+      },
+    ],
+  },
+  {
+    id: 'start_lead_absent',
+    title: '«Кора, начинай», руководителя нет: первое слово первому из присутствующих',
+    source: 'run1',
+    state: { phase: 'waiting', speaker: null, queue: [], present: ['tkach_t', 'nevsky_g'] },
+    steps: [
+      {
+        events: [heard('nevsky_g', 'Кора, начинай')],
+        expect: [[give(['tkach_t', 'nevsky_g'])]],
+        ideal: [{ action: 'give_word', person: 'nevsky_g', text: 'Доброе утро, коллеги! Глеб, начнёшь?' }],
+      },
+    ],
+  },
+  {
+    id: 'long_update_many_phrases',
+    title: 'длинный отчёт: много фраз с паузами по секунде — молчать до «у меня всё»',
+    source: 'design',
+    state: round('nevsky_g', ['tkach_t'], ['orlov_y', 'nevsky_g', 'tkach_t', 'belozersky_s']),
+    steps: [
+      ...['вчера закончил миграцию базы', 'сегодня разбираю алерты после неё', 'потом созвон с подрядчиком по интеграции', 'там вопрос по срокам', 'если успею посмотрю ревью Тимура'].map((text) => ({
+        events: [heard('nevsky_g', text), silence(1000)],
+        expect: [SILENT],
+        ideal: [{ action: 'skip' }],
+      })),
+      {
+        events: [heard('nevsky_g', 'вот такие планы у меня всё'), silence(1000)],
+        expect: [[give('tkach_t')]],
+        ideal: [{ action: 'give_word', person: 'tkach_t', text: '' }],
+      },
+    ],
+  },
+  {
+    id: 'speaker_hands_over',
+    title: 'говорящий сам передал слово по имени, не по очереди',
+    source: 'design',
+    state: round('tkach_t', ['nevsky_g', 'orlov_y']),
+    steps: [
+      {
+        events: [heard('tkach_t', 'у меня всё передаю Славе'), silence(1000)],
+        expect: [[give('orlov_y')]],
+        forbid: [give('nevsky_g')],
+        ideal: [{ action: 'give_word', person: 'orlov_y', text: '' }],
+      },
+    ],
+  },
+  {
+    id: 'next_in_queue_left',
+    title: 'следующий по очереди ушёл из звонка',
+    source: 'design',
+    state: round('tkach_t', ['nevsky_g', 'orlov_y']),
+    steps: [
+      {
+        events: [{ type: 'left', who: 'nevsky_g' }, { type: 'state', queue: ['orlov_y'] }, heard('tkach_t', 'у меня всё'), silence(1000)],
+        expect: [[give('orlov_y')]],
+        ideal: [{ action: 'give_word', person: 'orlov_y', text: '' }],
+      },
+    ],
+  },
+  {
+    id: 'noise_in_turn',
+    title: 'обрывки «а», «м» посреди отчёта',
+    source: 'design',
+    state: round('tkach_t', ['nevsky_g']),
+    dialog: [{ who: 'tkach_t', text: 'сегодня делаю интеграцию' }],
+    steps: [
+      {
+        events: [heardRaw('?', 'а'), heardRaw('tkach_t', 'м')],
+        expect: [SILENT],
+        ideal: [{ action: 'skip' }],
+      },
+    ],
+  },
+  {
+    id: 'round_last_done',
+    title: 'выступил последний: открыть слово всем',
+    source: 'design',
+    state: round('orlov_y', []),
+    dialog: [{ who: 'host', text: 'Спасибо! Дальше Слава.' }],
+    steps: [
+      {
+        events: [heard('orlov_y', 'по мне всё как планировали у меня всё'), silence(1000)],
+        expect: [[{ action: 'open_floor' }]],
+        forbid: [leave()],
+        ideal: [{ action: 'open_floor' }],
+      },
+    ],
+  },
+  {
+    id: 'her_line_cut',
+    title: 'её перебили вопросом: выслушать, не договаривать своё',
+    source: 'design',
+    state: { phase: 'open_floor', speaker: null, queue: [], present: ['tkach_t', 'nevsky_g', 'orlov_y'] },
+    steps: [
+      {
+        events: [her('Все высказались. Кто хочет что-то', true), { type: 'interrupted', text: 'подожди' }, heard('nevsky_g', 'подожди Кора у меня вопрос к Славе')],
+        expect: [SILENT],
+        forbid: [say(/все высказались|добавить/i)],
+        ideal: [{ action: 'skip' }],
+      },
+    ],
+  },
+
   // ---- open floor and the end -----------------------------------------------------------------------
   {
     id: 'open_floor_question_to_her',
@@ -330,6 +461,19 @@ export const SCENARIOS = Object.freeze([
         expect: [[say()], SILENT],
         forbid: [leave()],
         ideal: [{ action: 'say', text: 'Принято, Глеб. Кто-то ещё?' }],
+      },
+    ],
+  },
+  {
+    id: 'repeat_please',
+    title: 'просят повторить её вопрос: повторить его',
+    source: 'design',
+    state: { phase: 'open_floor', speaker: null, queue: [], present: ['tkach_t', 'nevsky_g'] },
+    steps: [
+      {
+        events: [her('Все высказались. Кто хочет что-то добавить или спросить?'), heard('tkach_t', 'повтори пожалуйста я не расслышал')],
+        expect: [[say(/добав|спрос/i)]],
+        ideal: [{ action: 'say', text: 'Все высказались. Кто хочет что-то добавить или спросить?' }],
       },
     ],
   },

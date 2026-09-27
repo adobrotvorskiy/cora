@@ -1,6 +1,6 @@
 {
   "_comment": "Post-STT corrections: the stand-in for config/stt_fixes.json (local, .gitignore: it lists the team's clients and products). Key = what it should be, value = how STT writes it. Whole words, case-insensitive; multi-word variants allowed. Applied before closers, kill phrases and the brain. STT has no vocabulary hints here: OpenRouter drops the prompt, SpeechKit streaming has none; «Корабль» = SpeechKit on «Кора».",
-  "Кора": ["Кара", "Корра", "Cora", "Kora", "Core", "Карра", "Карат", "Кару", "Коры", "Корабль"],
+  "Кора": ["Кара", "Хара", "Корра", "Cora", "Kora", "Core", "Карра", "Карат", "Кару", "Коры", "Корабль"],
   "дев-синк": ["дев синк", "девсинк", "dev sync", "dev-sync", "девсинг", "дев-синг"],
   "Яндекс Трекер": ["Яндекс трекер", "Yandex Tracker", "Яндекс Трэкер"],
   "Acme": ["Акме", "Экми", "Acmé"]

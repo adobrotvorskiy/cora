@@ -5,6 +5,8 @@ import { readFileSync } from 'node:fs';
 import { describe, test } from 'node:test';
 import { SCENARIOS, SCENARIO_LEAD, SCENARIO_ROSTER } from '../../src/agent/scenarios.js';
 import { applyEvent, checkStep, runScenarios } from '../../src/agent/scenario_runner.js';
+import { violation } from '../../src/agent/invariants.js';
+import { sttLike } from '../../src/agent/scenarios.js';
 import { TOOLS, buildSystemPrompt, createDraftAgent, renderInput, toActions } from '../../src/agent/draft_agent.js';
 
 const ids = new Set(SCENARIO_ROSTER.map((p) => p.id));
@@ -43,11 +45,44 @@ describe('scenarios: data', () => {
 });
 
 describe('scenario runner', () => {
-  test('the ideal answers pass every step', async () => {
-    const report = await runScenarios(SCENARIOS, idealAgent);
+  test('the ideal answers pass every step, invariants included', async () => {
+    const report = await runScenarios(SCENARIOS, idealAgent, { leadId: SCENARIO_LEAD });
     const failed = report.results.flatMap((r) => r.steps.filter((s) => !s.ok).map((s) => `${r.id}#${s.i}: ${s.why}`));
     assert.deepEqual(failed, []);
     assert.equal(report.must.ok, report.must.total);
+    assert.equal(report.violations, 0);
+  });
+
+  test('invariants: the same list the host will enforce', () => {
+    const sit = { phase: 'round', speaker: 'tkach_t', queue: ['nevsky_g'], present: ['tkach_t', 'nevsky_g', 'orlov_y'] };
+    assert.equal(violation({ action: 'give_word', person: 'belozersky_s' }, sit), 'not_present');
+    assert.equal(violation({ action: 'give_word', person: 'tkach_t' }, sit), 'already_has_the_floor');
+    assert.equal(violation({ action: 'ask_done', person: 'nevsky_g' }, sit), 'not_the_speaker');
+    assert.equal(violation({ action: 'open_floor' }, sit), 'queue_not_empty');
+    assert.equal(violation({ action: 'open_floor' }, { ...sit, queue: [] }), null);
+    assert.equal(violation({ action: 'leave', text: 'Пока!' }, sit), 'round_not_finished');
+    assert.equal(violation({ action: 'leave' }, { ...sit, present: [] }), null);
+    assert.equal(violation({ action: 'say', text: 'Я не отвечаю на вопросы во время отчётов.' }, sit), 'invented_rule');
+    assert.equal(violation({ action: 'say', text: 'Да, слышу. Тима, продолжай.' }, sit), 'bridge');
+    assert.equal(violation({ action: 'say', text: 'а'.repeat(300) }, sit), 'too_long');
+    assert.equal(violation({ action: 'say', text: 'Есть кто?' }, { ...sit, present: [] }), 'empty_room');
+    const waiting = { phase: 'waiting', speaker: null, queue: [], present: ['tkach_t', 'orlov_y'] };
+    assert.equal(violation({ action: 'give_word', person: 'tkach_t' }, waiting, { leadId: 'orlov_y' }), 'lead_goes_first');
+    assert.equal(violation({ action: 'give_word', person: 'orlov_y' }, waiting, { leadId: 'orlov_y' }), null);
+  });
+
+  test('a violation fails the step even when the expectation is met; the report counts it', async () => {
+    const sc = SCENARIOS.filter((x) => x.id === 'turn_end_closer');
+    const report = await runScenarios(sc, async () => ({ actions: [{ action: 'give_word', person: 'nevsky_g', text: 'Спасибо! Тима, продолжай.' }] }), { leadId: SCENARIO_LEAD });
+    assert.equal(report.violations, 1);
+    assert.match(report.results[0].steps[0].why, /invariant bridge/);
+  });
+
+  test('scenario input looks like SpeechKit: lower case, no punctuation, «Кора» restored', () => {
+    assert.equal(sttLike('Кора, привет! Ты меня слышишь?'), 'Кора привет ты меня слышишь');
+    assert.equal(sttLike('КОРА начинай.'), 'Кора начинай');
+    const greet = SCENARIOS.find((x) => x.id === 'greet_by_name').steps[0].events[0].text;
+    assert.ok(!/[?!,.]/.test(greet), greet);
   });
 
   test('the failures of the live tests are caught', async () => {
@@ -102,7 +137,9 @@ describe('draft agent', () => {
     const prompt = buildSystemPrompt({ roster: SCENARIO_ROSTER, leadId: SCENARIO_LEAD });
     assert.match(prompt, /orlov_y — Ярослав Орлов \(зовёшь «Слава»\), руководитель/);
     assert.match(prompt, /Отвечай только вызовами инструментов/);
-    assert.deepEqual(TOOLS.map((t) => t.function.name), ['say', 'give_word', 'ask_done', 'skip', 'leave']);
+    assert.deepEqual(TOOLS.map((t) => t.function.name), ['say', 'give_word', 'ask_done', 'open_floor', 'skip', 'leave']);
+    assert.match(prompt, /2,5 с без «у меня всё» — спроси «всё\?»/);
+    assert.match(prompt, /rejected/);
     const input = JSON.parse(renderInput({ phase: 'round', speaker: 'tkach_t', present: ['tkach_t'], dialog: Array.from({ length: 20 }, (_, i) => ({ who: 'tkach_t', text: `${i}` })), events: [] }));
     assert.equal(input.dialog.length, 12);
     assert.deepEqual(toActions([{ name: 'give_word', args: { person_id: 'nevsky_g', text: '' } }, { name: 'say', args: { text: ' Привет ' } }]), [
@@ -132,6 +169,6 @@ describe('draft agent', () => {
     assert.ok(Number.isFinite(r.timings.first_tool_name));
     assert.equal(agent.toolChoice, 'auto');
     assert.deepEqual(bodies.map((b) => b.tool_choice), ['required', 'auto']);
-    assert.equal(bodies[1].tools.length, 5);
+    assert.equal(bodies[1].tools.length, 6);
   });
 });
