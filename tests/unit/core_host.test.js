@@ -654,6 +654,32 @@ describe('host helpers', () => {
   });
 });
 
+describe('host: open floor in a 1:1', () => {
+  test('after «кто хочет добавить?» the one person is talking to her (no «?» from STT); «нет, спасибо» is not a question; no re-asking within 30 s', async () => {
+    const script = (trigger) => (trigger === 'question_to_host' ? { why: '', action: 'answer', to: null, text: 'Нет, кроме тебя никого.', plan: null } : null);
+    const h = makeHost({ present: ['Тимур Ткач'], brainScript: script });
+    await h.ready();
+    h.host._test.beginRound('tkach_t');
+    await h.host._test.run(() => h.host._test.endTurnSequence('closer'));
+    await h.settle(400);
+    assert.equal(h.find('round.open_floor_asked').length, 1);
+    h.ears.emit('stt_final', { item_id: 'o1', text: 'а тут кто то есть кроме меня', t: h.t.now, t_speech_start: h.t.now - 2000, t_speech_end: h.t.now });
+    await h.settle(300);
+    assert.equal(h.find('host.question')[0]?.how, 'open_floor');
+    assert.equal(h.player.plays.at(-1).meta.kind, 'answer');
+    h.ears.emit('stt_final', { item_id: 'o2', text: 'нет спасибо', t: h.t.now, t_speech_start: h.t.now - 900, t_speech_end: h.t.now });
+    await h.settle(300);
+    assert.equal(h.find('host.question').length, 1, '«нет, спасибо» is not a question');
+    const openFloorText = h.find('speech.start').find((e) => e.kind === 'open_floor').text;
+    await h.advance(12_000, LOUD); // > the old 10 s window; a busy room keeps the open floor from closing meanwhile
+    assert.equal(h.host.phase, 'open_floor');
+    await h.host._test.applyAction({ why: '', action: 'speak', to: null, text: openFloorText, plan: null }, 'silence');
+    await h.settle(100);
+    assert.ok(h.find('host.action_ignored').some((e) => e.action === 'speak' && e.reason === 'duplicate'), 'no re-asking the open-floor question');
+    await h.finish();
+  });
+});
+
 describe('host: on-demand mode (no schedule)', () => {
   test('--max-minutes: farewell to people in the room, silent exit from an empty one', async () => {
     const empty = makeHost({ present: [], onDemand: true, flags: { maxMinutes: 0.02 } });

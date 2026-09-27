@@ -64,6 +64,8 @@ const SPEECH_QUEUE_MAX = 4;
 const ACK_GAP_MS = 150;
 const SHORT_TURN_MS = 6000;
 const RECENT_SAID_MS = 10_000;
+const SPEAK_REPEAT_MS = 30_000; // live 27.09: the brain re-asked «кто хочет добавить?» 14 s after the open-floor clip
+const RECENT_SAID_KEEP_MS = 60_000;
 const OWN_UTTERANCE_WINDOW_MS = 8000;
 const START_REPLY_WINDOW_MS = 12_000; // «давай начнём» without her name, this soon after her own line, is a reply to her
 const BRAIN_ON_BARGE_KINDS = new Set(['answer', 'speak', 'greeting', 'proposal']);
@@ -72,6 +74,8 @@ const BLOCKER_RE = /(?:^|[^\p{L}])(?:блокер|блокир|застрял|м
 const QUESTION_RE = /\?\s*$|^(?:а\s+|и\s+|ну\s+|слушай[, ]+)?(?:кто|что|чего|как|какой|какая|какие|какое|почему|зачем|где|когда|откуда|куда|сколько|чем|чей|можешь|умеешь|расскажи|скажи)(?![\p{L}])/iu;
 const YOU_RE = /(?:^|[^\p{L}])(?:ты|тебя|тебе|тобой|твой|твоя|твоё|твое|твои)(?![\p{L}])/iu;
 const AI_RE = /(?:^|[^\p{L}])(?:ии|искусствен|нейросет|бот|робот|модель|ведущ|алгоритм|нейронк|железяк)/iu;
+/** Words of a «nothing to add» reply to her open-floor question. */
+const NOTHING_TO_ADD = new Set(['нет', 'неа', 'не', 'да', 'спасибо', 'всё', 'все', 'ничего', 'вопросов', 'нечего', 'добавить', 'у', 'меня', 'нас', 'пожалуй', 'наверное', 'вроде', 'ок', 'окей', 'хорошо', 'пока', 'нету', 'никаких']);
 
 /** config/stt_fixes.json -> [{re, to}] (canonical form -> STT variants, whole words, case-insensitive). */
 export function loadSttFixes(path = contentPath('stt_fixes.json')) {
@@ -359,10 +363,10 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     return buildContext(snap, { windowSec: 45, maxEvents: 20, maxTokens: 2500, leadId: state.firstAlways });
   }
 
-  function recentlySaid(text) {
+  function recentlySaid(text, ms = RECENT_SAID_MS) {
     const t = wall();
-    flow.recentSaid = flow.recentSaid.filter((r) => t - r.at <= RECENT_SAID_MS);
-    return flow.recentSaid.some((r) => sameLine(text, r.text));
+    flow.recentSaid = flow.recentSaid.filter((r) => t - r.at <= RECENT_SAID_KEEP_MS);
+    return flow.recentSaid.some((r) => t - r.at <= ms && sameLine(text, r.text));
   }
 
   // ------------------------------------------------------------------------------------ speech
@@ -648,7 +652,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
         }
         const text = guards.limitText(action.text);
         if (busyTalking && trigger !== 'question_to_host') return ev('host.action_ignored', { action: 'speak', reason: 'already_speaking', text });
-        if (recentlySaid(text)) return ev('host.action_ignored', { action: 'speak', reason: 'duplicate', text });
+        if (recentlySaid(text, SPEAK_REPEAT_MS)) return ev('host.action_ignored', { action: 'speak', reason: 'duplicate', text });
         say({ text, kind: 'speak', meta: { trigger } });
         return;
       }
@@ -1174,8 +1178,11 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
 
   function questionToHost(text) {
     if (guards.mentionsHost(text)) return 'name';
-    if (!looksLikeQuestion(text)) return null;
     const present = state.presentIds().length;
+    // her «кто хочет добавить или спросить?» in a 1:1: whatever the one person says next is for her, unless it is
+    // «нет, спасибо» (live 27.09: STT gives no «?», and «а тут кто-то есть кроме меня» went unanswered)
+    if (state.phase === 'open_floor' && flow.openFloorAt !== null && present <= 1 && !foldWords(text).every((w) => NOTHING_TO_ADD.has(w))) return 'open_floor';
+    if (!looksLikeQuestion(text)) return null;
     if (present <= 2) return 'small_group';
     if (YOU_RE.test(text) && flow.lastSpokenAt && wall() - flow.lastSpokenAt < OWN_UTTERANCE_WINDOW_MS) return 'after_own_utterance';
     if (AI_RE.test(text)) return 'about_ai';
