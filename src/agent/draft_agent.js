@@ -11,7 +11,9 @@
 // Text without a tool call becomes {action: 'none', text} (the host treats it as skip, never speaks it). The request is streamed (readToolStream): timings tell
 // when the first tool name arrived — where the host would start a filler («Так…»).
 
+import { ENDPOINTS, resolveProvider } from '../brain/client.js';
 import { readToolStream, toolCallsOfMessage } from '../brain/tool_stream.js';
+import { requireKey } from '../env.js';
 
 const fn = (name, description, properties = {}, required = Object.keys(properties)) => ({
   type: 'function',
@@ -37,10 +39,10 @@ export const TOOLS = Object.freeze([
 export function buildSystemPrompt({ roster, leadId = null, team = 'Acme' }) {
   const lead = roster.find((p) => p.id === leadId);
   const people = roster.map((p) => `${p.id} — ${p.display}${p.vocative ? ` (зовёшь «${p.vocative.replace(/́/g, '')}»)` : ''}${p.id === leadId ? ', руководитель' : ''}`).join('; ');
-  return `Ты Кора, ИИ-ведущая ежедневного стендапа команды ${team} в Яндекс Телемосте. Ты ИИ и не выдаёшь себя за человека. О себе в женском роде, по-русски, коротко: одна-две фразы.
+  return `Ты Кора, ИИ-ведущая ежедневного стендапа${team ? ` команды ${team}` : ''} в Яндекс Телемосте. Ты ИИ и не выдаёшь себя за человека. О себе в женском роде, по-русски, коротко: одна-две фразы.
 
 Как идёт стендап. Начинаешь, когда попросят: по имени («Кора, начинай») или сразу в ответ на твою реплику («давай начнём»). Первое слово — ${lead ? `${lead.display}, если он на встрече` : 'первому из присутствующих'}, дальше по очереди queue; если говорящий сам назвал, кому передаёт, — ему. Каждый рассказывает свои планы. Человек закончил, если сказал «у меня всё», «как-то так», «на этом всё», «передаю» или ответил «да» на твоё «всё?».
-Тишина (события silence, ms — сколько длится): 1 с после фразы — обычно ещё рано, skip, если человек не сказал, что закончил; 2,5 с без «у меня всё» — спроси «всё?» (ask_done); 6 с тишины после «всё?» — считай, что закончил. Закончил — передай слово следующему (give_word; хост сам поблагодарит). Выступил последний (queue пуст) — open_floor. На открытом слове: ответили «нет» или 6 с тишины — попрощайся и передай слово на дев-синк (leave); что-то добавили — коротко прими и спроси, кто ещё.
+Тишина (события silence: ms — сколько длится, after — после чего: speech — после речи людей, host — после твоей реплики, ask_done — после твоего «всё?»): 1 с после фразы — обычно ещё рано, skip, если человек не сказал, что закончил; 2,5 с без «у меня всё» — спроси «всё?» (ask_done); 6 с тишины после «всё?» — считай, что закончил. Закончил — передай слово следующему (give_word; хост сам поблагодарит). Выступил последний (queue пуст) — open_floor. На открытом слове: ответили «нет» или 6 с тишины — попрощайся и передай слово на дев-синк (leave); что-то добавили — коротко прими и спроси, кто ещё.
 
 Когда говорить. Отвечай на реплики, обращённые к тебе, даже без имени: «ты», «почему молчишь», «я тебе вопрос задал», «ты нас слышишь». Люди говорят между собой, человек ещё рассказывает, пауза посреди фразы — skip. Не перебивай, не пересказывай и не оценивай апдейты. Если тебя перебили на передаче слова, выслушай и реагируй на сказанное.
 
@@ -48,7 +50,7 @@ export function buildSystemPrompt({ roster, leadId = null, team = 'Acme' }) {
 
 Правила. Не повторяй то, что уже сказала (твои реплики в dialog с who "host"); второй раз не здоровайся и не спрашивай «кто хочет добавить?», если тебе уже ответили. Не выдумывай правил, ограничений и фактов о себе. Ответила на вопрос посреди чужого отчёта — слово остаётся у говорящего, ничего вроде «продолжай» не добавляй. В пустой комнате молчи.
 
-Вход — JSON: phase (waiting — до старта, round — идёт круг, open_floor — ты спросила, кто хочет добавить), speaker (у кого слово), queue (кто дальше по очереди), present (кто на встрече), dialog (последние реплики; who "host" — это ты, cut — тебя перебили), events (что только что случилось: heard — реплика, silence — тишина ms, joined / left — пришёл / ушёл, interrupted — тебя перебили, chorus — говорят хором, rejected — хост отклонил твой прошлый вызов, reason — почему; не повторяй его).
+Вход — JSON: phase (waiting — до старта, round — идёт круг, open_floor — ты спросила, кто хочет добавить), speaker (у кого слово), queue (кто дальше по очереди), present (кто на встрече), dialog (последние реплики; who "host" — это ты, cut — тебя перебили), events (что только что случилось: heard — реплика, silence — тишина ms, joined / left — пришёл / ушёл, interrupted — тебя перебили, chorus — говорят хором, rejected — хост отклонил твой прошлый вызов, reason — почему; не повторяй его; timer start — время начинать по расписанию).
 
 Участники (id — имя): ${people}.
 
@@ -98,7 +100,7 @@ export function toActions(toolCalls, content = '') {
  */
 export function createDraftAgent({ endpoint, apiKey, model, system, fetch: fetchImpl = globalThis.fetch, timeoutMs = 15_000, stream = true, temperature = 0.2 }) {
   let toolChoice = 'required';
-  async function post(input) {
+  async function post(input, signal) {
     for (let attempt = 0; attempt < 2; attempt++) {
       const started = performance.now();
       const res = await fetchImpl(endpoint, {
@@ -113,7 +115,7 @@ export function createDraftAgent({ endpoint, apiKey, model, system, fetch: fetch
           max_tokens: 400,
           ...(stream ? { stream: true } : {}),
         }),
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: signal ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]) : AbortSignal.timeout(timeoutMs),
       });
       if (res.ok) return { res, started };
       const text = (await res.text().catch(() => '')).slice(0, 400);
@@ -129,8 +131,9 @@ export function createDraftAgent({ endpoint, apiKey, model, system, fetch: fetch
     get toolChoice() {
       return toolChoice;
     },
-    async decide(input) {
-      const { res, started } = await post(input);
+    /** @param {object} input  @param {{signal?: AbortSignal}} [o]  signal: the host aborts a decision a newer event made stale */
+    async decide(input, { signal } = {}) {
+      const { res, started } = await post(input, signal);
       if (/event-stream/i.test(res.headers.get('content-type') ?? '')) {
         const r = await readToolStream(res, { started });
         return { actions: toActions(r.toolCalls, r.content), timings: r.timings, usage: r.usage };
@@ -140,4 +143,24 @@ export function createDraftAgent({ endpoint, apiKey, model, system, fetch: fetch
       return { actions: toActions(toolCallsOfMessage(msg), msg.content), timings: { done: Math.round(performance.now() - started) }, usage: json.usage ?? null };
     },
   };
+}
+
+/**
+ * The agent for the host (voice.host = "agent"): Yandex AI Studio, key and folder as for the brain
+ * (settings.keys.yandex, settings.yandex.folder), model settings.agent.model or brain.yandex_model.
+ * @param {{settings: object, roster: {people: object[], firstAlways?: string|null, teamName?: string|null}, env?: object, fetch?: Function}} o
+ */
+export function agentFromSettings({ settings, roster, env = process.env, fetch: fetchImpl }) {
+  const sel = resolveProvider(settings, { env, provider: 'yandex', model: settings.agent?.model });
+  const people = (roster?.people ?? []).filter((p) => !p.exclude).map((p) => ({ id: p.id, display: p.display, vocative: p.vocative ?? p.spoken ?? null }));
+  const agent = createDraftAgent({
+    endpoint: settings.agent?.endpoint ?? ENDPOINTS.yandex,
+    apiKey: requireKey(sel.keyName, env),
+    model: sel.model,
+    system: buildSystemPrompt({ roster: people, leadId: roster?.firstAlways ?? null, team: roster?.teamName ?? '' }),
+    timeoutMs: settings.agent?.timeout_ms ?? 8000,
+    temperature: settings.agent?.temperature ?? 0.2,
+    ...(fetchImpl ? { fetch: fetchImpl } : {}),
+  });
+  return Object.assign(agent, { model: sel.model, provider: 'yandex' });
 }

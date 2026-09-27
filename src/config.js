@@ -154,6 +154,12 @@ export function validateSettings(s) {
       if (y.tts_pricing !== undefined && !isPlainObject(y.tts_pricing)) errors.push('yandex.tts_pricing must be an object {rub_per_unit, chars_per_unit}');
       if (y.cascade_mouth !== undefined && !['speechkit', 'elevenlabs'].includes(y.cascade_mouth)) errors.push('yandex.cascade_mouth must be speechkit|elevenlabs');
     }
+    if (v.host !== undefined && !['automaton', 'agent'].includes(v.host)) errors.push('voice.host must be automaton|agent');
+    if (v.host === 'agent') {
+      // the agent (src/agent/conductor.js) runs on Yandex AI Studio: the same key and folder as the cascade brain
+      if (typeof s.yandex?.folder !== 'string' || !s.yandex.folder.trim()) errors.push('yandex.folder must be the cloud folder id for voice.host agent');
+      if (v.provider === 'elevenlabs_agent' || v.provider === 'yandex_rt') errors.push(`voice.host agent needs ears and a mouth (yandex_cascade or openrouter), not ${v.provider}`);
+    }
     if (v.eleven !== undefined && !isPlainObject(v.eleven)) errors.push('voice.eleven must be an object');
     for (const group of ['vad', 'stt']) {
       if (v[group] === undefined) continue;
@@ -170,6 +176,15 @@ export function validateSettings(s) {
     const early = isPlainObject(v.stt) ? v.stt.early_final_ms : undefined;
     if (typeof early === 'number' && early > 0 && typeof vad.stop_ms === 'number' && early >= vad.stop_ms) {
       warnings.push(`voice.stt.early_final_ms (${early}) >= voice.vad.stop_ms (${vad.stop_ms}): the speculative final is off`);
+    }
+  }
+  if (s?.agent !== undefined) {
+    const a = s.agent;
+    if (!isPlainObject(a)) errors.push('agent must be an object {model, timeout_ms, temperature, budget, pricing}');
+    else {
+      for (const k of ['timeout_ms', 'temperature']) if (a[k] !== undefined && (typeof a[k] !== 'number' || !Number.isFinite(a[k]))) errors.push(`agent.${k} must be a number`);
+      if (a.budget !== undefined && !isPlainObject(a.budget)) errors.push('agent.budget must be an object {max_calls, max_tokens, max_rub}');
+      if (a.pricing !== undefined && a.pricing !== null && !isPlainObject(a.pricing)) errors.push('agent.pricing must be an object {rub_per_1k_input, rub_per_1k_output}');
     }
   }
   if (isPlainObject(s?.keys)) {

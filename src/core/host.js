@@ -37,13 +37,17 @@ import { attachPageAudio, serveAssets } from '../browser/page_inject.js';
 import * as telemost from '../browser/telemost.js';
 import { buildContext } from '../brain/context.js';
 import { SlotRecorder } from '../audio/slot_recorder.js';
+import { createConductor } from '../agent/conductor.js';
 import { sendAlert } from '../ops/telegram.js';
+import { foldWords, looksLikeQuestion, questionToHost as addressedQuestion } from './addressing.js';
 import { createAttribution } from './attribution.js';
 import { loadClips, loadPlayer, loadVoice, NO_VOICE_KIND } from './deps.js';
 import { AsyncQueue, RingLog, Serializer, Transcript } from './events.js';
 import { classifyCheckDoneAnswer, createFloor, detectCloser } from './floor.js';
 import { START_RE, createGuards, realRoomAllowed } from './guards.js';
 import { createState, loadRoster } from './state.js';
+
+export { looksLikeQuestion };
 
 const EXIT = Object.freeze({ ok: 0, error: 1, usage: 64, sigint: 130 });
 const TICK_MS = 50;
@@ -67,21 +71,16 @@ const SHORT_TURN_MS = 6000;
 const RECENT_SAID_MS = 10_000;
 const SPEAK_REPEAT_MS = 30_000; // live 27.09: the brain re-asked «кто хочет добавить?» 14 s after the open-floor clip
 const RECENT_SAID_KEEP_MS = 60_000;
-const OWN_UTTERANCE_WINDOW_MS = 8000;
 const SMALL_GROUP_MAX = 2; // people in the room (without her) up to which every line goes to the brain
 const EMPTY_ROOM_LEAVE_MS = 15_000; // after the round started: everyone left this long ago -> she leaves silently
 const START_REPLY_WINDOW_MS = 12_000; // «давай начнём» without her name, this soon after her own line, is a reply to her
 const BRAIN_ON_BARGE_KINDS = new Set(['answer', 'speak', 'greeting', 'proposal']);
 const COST = Object.freeze({ usd_rub: 90, realtime_audio_in_per_m: 32, realtime_audio_out_per_m: 64, realtime_text_in_per_m: 4, realtime_text_out_per_m: 16, transcribe_per_min: 0.006 });
+/** Lines of an agent's turn change queued later by the flow (after the ack): they carry the decision's epoch. */
+const AGENT_FLOW_KINDS = new Set(['ack', 'handoff', 'open_floor', 'wrap_up']);
+/** A line dropped before it played (a newer decision or event made it stale). */
+const dropped = (r) => r?.status === 'skipped' && r.reason === 'superseded';
 const BLOCKER_RE = /(?:^|[^\p{L}])(?:блокер|блокир|застрял|мешает|проблем|риск|не могу|не получается|не успева|тормозит|горит|нужна помощь|нужна поддержка|стопор)/iu;
-const QUESTION_RE = /\?\s*$|^(?:а\s+|и\s+|ну\s+|слушай[, ]+)?(?:кто|что|чего|как|какой|какая|какие|какое|почему|зачем|где|когда|откуда|куда|сколько|чем|чей|можешь|умеешь|расскажи|скажи)(?![\p{L}])/iu;
-// STT gives no «?»: a question word among the first four words, not the indefinite «кто-то / что-нибудь»
-const QUESTION_NEAR_START_RE = /^(?:\S+\s+){0,3}(?:кто|что|чего|как|какой|какая|какие|какое|почему|зачем|где|когда|откуда|куда|сколько|чем|чей|можешь|умеешь|расскажи|скажи)(?![\p{L}])(?![\s-]+(?:то|нибудь|либо)(?![\p{L}]))/iu;
-const YOU_RE = /(?:^|[^\p{L}])(?:ты|тебя|тебе|тобой|твой|твоя|твоё|твое|твои)(?![\p{L}])/iu;
-const AI_RE = /(?:^|[^\p{L}])(?:ии|искусствен|нейросет|бот|робот|модель|ведущ|алгоритм|нейронк|железяк)/iu;
-/** Words of a «nothing to add» reply to her open-floor question. */
-const NOTHING_TO_ADD = new Set(['нет', 'неа', 'не', 'да', 'спасибо', 'всё', 'все', 'ничего', 'вопросов', 'нечего', 'добавить', 'у', 'меня', 'нас', 'пожалуй', 'наверное', 'вроде', 'ок', 'окей', 'хорошо', 'пока', 'нету', 'никаких']);
-
 /** config/stt_fixes.json -> [{re, to}] (canonical form -> STT variants, whole words, case-insensitive). */
 export function loadSttFixes(path = contentPath('stt_fixes.json')) {
   let data;
@@ -111,12 +110,6 @@ export function applySttFixes(text, fixes) {
   return s;
 }
 
-/** Does the line look like a question (for questions to the host without her name)? */
-export function looksLikeQuestion(text) {
-  const s = String(text ?? '').trim();
-  return Boolean(s) && QUESTION_RE.test(s);
-}
-
 /** Same line modulo case/punctuation/ё, one being the start of the other, or the same first sentence. */
 export function sameLine(a, b) {
   const fold = (s) => String(s ?? '').toLowerCase().replace(/ё/g, 'е').replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
@@ -133,14 +126,6 @@ export function sameLine(a, b) {
   return ha.split(' ').length >= 3 && ha === hb;
 }
 
-const foldWords = (s) =>
-  String(s ?? '')
-    .toLowerCase()
-    .replace(/ё/g, 'е')
-    .replace(/[^\p{L}\p{N}]+/gu, ' ')
-    .trim()
-    .split(' ')
-    .filter((w) => w.length >= 2);
 const INTERRUPT_RE = /(?:^|[^\p{L}])(?:подожди|погоди|стоп|стой|секунду|минутку|извини|прости)(?![\p{L}])/iu;
 
 /**
@@ -194,6 +179,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     loadPlayer,
     loadClips,
     createBrain: null,
+    createAgent: null,
     SlotRecorder,
     sendAlert,
     roster: null,
@@ -228,7 +214,10 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     log,
     now: wall,
     // yandex_cascade: two SFU slots loud at once = people talking over each other; the brain sees it in recent events
-    onChorus: ({ ids }) => note('chorus', { who: ids.length ? ids : ['?'] }),
+    onChorus: ({ ids }) => {
+      note('chorus', { who: ids.length ? ids : ['?'] });
+      conductor?.chorus({ who: ids.length ? ids : ['?'] });
+    },
   });
   const guards = createGuards({ settings, flags, log, now: nowMs, stopFile: D.stopFile, stopIntervalMs: D.stopIntervalMs });
   const recent = new RingLog(60);
@@ -242,6 +231,11 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
   let player = null;
   let clips = null;
   let brain = null;
+  // voice.host = "agent" (docs/agent_plan.md step 3): an LLM with tools decides what to say (src/agent/conductor.js);
+  // the turn automaton below (closers, «всё?» timers, open-floor silence, scripted start) stays off
+  const agentMode = settings.voice?.host === 'agent';
+  let conductor = null;
+  let agentExec = null; // the epoch of the agent decision being executed (stamps the lines it queues)
   let recorder = null; // --record: PCM per slot for tuning STT / Smart Turn (test rooms only)
   let stopObservers = null;
   let tickTimer = null;
@@ -277,6 +271,8 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     closingStarted: false,
     closingBarged: false,
     lastCheckDoneFor: null,
+    lastAckFor: null, // agent mode: the ack «Спасибо, X!» already played for X (a re-decided handoff does not thank twice)
+    bargeText: null, // the recognized words that stopped her (agent: the interrupted event)
     turnEnd: null, // {at, prev, to, reason, phase} while a turn-end playback (ack/handoff/open floor) is in flight
     maxMinutesFired: false,
     startRequestedAt: null, // on-demand mode: «Кора, начинай» final that opened the standup
@@ -411,6 +407,11 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
       ev('speech.dropped', { reason: 'queue_full', key: spec.key ?? null, text: spec.text ?? null });
       return;
     }
+    if (conductor) {
+      // agent mode: a line carries the epoch of the decision behind it; a newer event drops it (dropAgentLines)
+      spec.agentEpoch ??= agentExec ?? (AGENT_FLOW_KINDS.has(spec.kind) ? (flow.turnEnd?.agentEpoch ?? null) : null);
+      if (spec.agentEpoch != null && spec.agentEpoch < conductor.epoch) spec.superseded = true;
+    }
     const item = { spec, after };
     if (front) speechQueue.unshift(item);
     else speechQueue.push(item);
@@ -483,6 +484,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
         flow.lastSpokenAt = wall();
         flow.recentSaid.push({ text, at: wall(), completed: true });
         transcriptOwnLine(text);
+        conductor?.herLine({ text, kind: spec.kind ?? null, t: wall() });
         return { status: 'shadow', text, played_ratio: 1 };
       }
       return { status: 'suppressed', reason: allowed.reason, text, played_ratio: 0 };
@@ -559,6 +561,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     said.completed = result.status === 'completed';
     ownLine.cut = result.status === 'aborted';
     if (result.status === 'completed') flow.lastSpokenAt = wall();
+    if (conductor && (result.status === 'completed' || result.status === 'aborted')) conductor.herLine({ text, cut: result.status === 'aborted', kind: meta.kind, t: wall() });
     ev(result.status === 'aborted' ? 'speech.abort' : 'speech.end', {
       status: result.status,
       source: clip ? 'clip' : 'live',
@@ -651,6 +654,94 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
       ev('speech.dropped', { reason: 'superseded', count: stale.length, texts: stale.map((i) => i.spec.text) });
     }
     if (hit(gateSpec)) gateSpec.superseded = true;
+  }
+
+  // ------------------------------------------------------------------------------------- agent
+
+  /** Agent mode: her lines still waiting (queued or at the floor gate) with an epoch older than `epoch` are dropped. */
+  function dropAgentLines(epoch) {
+    let n = 0;
+    const hit = (spec) => spec && spec.agentEpoch != null && spec.agentEpoch < epoch && !spec.superseded;
+    for (const item of speechQueue) {
+      if (hit(item.spec)) {
+        item.spec.superseded = true;
+        n++;
+      }
+    }
+    if (hit(gateSpec)) {
+      gateSpec.superseded = true;
+      n++;
+    }
+    return n;
+  }
+
+  /** Run a flow for the agent: every line it queues now carries the decision's epoch. */
+  function asAgent(epoch, fn) {
+    const prev = agentExec;
+    agentExec = epoch;
+    try {
+      return fn() ?? { ok: true };
+    } finally {
+      agentExec = prev;
+      if (flow.turnEnd && flow.turnEnd.agentEpoch == null) flow.turnEnd.agentEpoch = epoch;
+    }
+  }
+
+  /** The executor behind the agent's tools (src/agent/conductor.js checks the invariants first). */
+  function agentIo() {
+    const text = (t) => (t ? guards.limitText(t) || null : null);
+    const busyTurn = () => (flow.turnEnd ? { ok: false, reason: 'turn_change_in_progress' } : flow.closingStarted ? { ok: false, reason: 'closing' } : null);
+    return {
+      say: ({ text: t, how, epoch }) => {
+        const line = text(t);
+        if (!line) return { ok: false, reason: 'empty_text' };
+        // asked by name: a room that never goes quiet must not keep the answer back (CLAUDE.md, 26.09)
+        return asAgent(epoch, () => say({ text: line, kind: 'agent_say', meta: { how: how ?? null }, ...(cascade && how === 'name' ? { forceAfterMs: ADDRESSED_FORCE_MS } : {}) }));
+      },
+      startRound: ({ person, text: t, how, epoch }) => {
+        if (flow.roundStarted) return { ok: false, reason: 'round_started' };
+        if (how === 'name') flow.startRequestedAt ??= nowMs(); // «Кора, начинай»: the opening line may not wait for a noisy room
+        return asAgent(epoch, () => startRound(person, text(t)));
+      },
+      giveWord: ({ person, text: t, epoch }) => {
+        const busy = busyTurn();
+        if (busy) return busy;
+        if (!flow.roundStarted) return asAgent(epoch, () => startRound(person, text(t)));
+        return asAgent(epoch, () => {
+          if (state.phase === 'open_floor') {
+            state.setPhase('round'); // a late joiner who has not spoken yet
+            bump();
+          }
+          const prev = state.current;
+          const prevGone = prev && !state.get(prev)?.present;
+          if (t || prevGone || (prev && flow.lastAckFor === prev)) return handoff(person, text(t), { reason: 'agent', plain: !t });
+          state.planInsert(person, { front: true });
+          endTurnSequence('agent');
+        });
+      },
+      askDone: ({ person, epoch }) => asAgent(epoch, () => say({ key: 'check_done', person, kind: 'check_done' })),
+      openFloor: ({ epoch }) => {
+        const busy = busyTurn();
+        if (busy) return busy;
+        if (state.phase !== 'round') return { ok: false, reason: 'not_in_round' };
+        return asAgent(epoch, () => {
+          state.setPlan({ next: null, then: [] });
+          const prev = state.current;
+          if (!prev || !state.get(prev)?.present || flow.lastAckFor === prev) return openFloor('agent');
+          endTurnSequence('agent');
+        });
+      },
+      leave: ({ text: t, epoch }) => {
+        if (flow.closingStarted) return { ok: false, reason: 'closing' };
+        return asAgent(epoch, () => startClosing('agent', text(t)));
+      },
+      drop: dropAgentLines,
+      roomSpeaking: () => floor.active || floor.vadOpen,
+      hostBusy: () => hostState.speaking || Boolean(currentSpeech) || speechQueue.length > 0 || Boolean(gateSpec) || Boolean(flow.turnEnd),
+      canSpeak: () => floor.canSpeak(wall()),
+      quiet: () => quiet,
+      alert: (t) => alert(t, 'warn'),
+    };
   }
 
   // ------------------------------------------------------------------------------------- brain
@@ -819,6 +910,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     floor.newTurn({ speaker: id, t: wall() });
     attribution.setPresumed(id, { t: wall() });
     flow.lastCheckDoneFor = null;
+    flow.lastAckFor = null;
     flow.turnEnd = null;
     bump();
     note('turn_start', { who: id });
@@ -836,6 +928,14 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     ev('round.start', { first: id, key, day_mode: dayMode, lead_present: state.leadPresent() });
     const asked = cascade && flow.startRequestedAt !== null; // «Кора, начинай»: people are waiting for her
     say({ key: text ? null : key, text, person: id, kind: 'start', maxWaitMs: 15_000, ...(asked ? { forceAfterMs: ADDRESSED_FORCE_MS } : {}) }, (r) => {
+      if (dropped(r)) {
+        // agent mode: people spoke again before the opening line played — the agent decides anew
+        flow.roundStarted = false;
+        state.setPhase('waiting');
+        bump();
+        ev('round.start_dropped', { first: id });
+        return;
+      }
       if (r.status === 'suppressed' || r.status === 'failed') ev('round.start_unspoken', { status: r.status });
       beginTurn(id);
       if (!flow.greetedAt) flow.greetedAt = nowMs();
@@ -883,6 +983,8 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     if (!withAck) return proceed();
     say(ackSpecFor(prev), (r) => {
       if (r.status === 'aborted') return revertTurnEnd('barge_in_during_ack');
+      if (dropped(r)) return revertTurnEnd('dropped_ack');
+      if (r.status === 'completed' || r.status === 'shadow') flow.lastAckFor = prev;
       proceed();
     });
   }
@@ -902,6 +1004,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     ev('turn.handoff', { from: prev, to, key, reason, text: text ?? null });
     say({ key: text ? null : key, text, person: to, kind: 'handoff', gapBeforeMs: gap ? ACK_GAP_MS : 0, meta: { from: prev, to } }, (r) => {
       if (r.status === 'aborted') return revertTurnEnd('barge_in_during_handoff');
+      if (dropped(r)) return revertTurnEnd('dropped_handoff');
       if (r.status === 'skipped' && r.reason === 'room_active') return postponeTurnEnd(to);
       const te = flow.turnEnd;
       if (prev && state.current === prev) state.finishTurn({ t: nowMs(), status: te?.reason === 'no_speech' ? 'skipped' : 'spoke' });
@@ -920,6 +1023,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     ev('round.open_floor', { reason, ...state.summary() });
     say({ key: 'open_floor', kind: 'open_floor', maxWaitMs: 20_000 }, (r) => {
       if (r.status === 'aborted') return revertTurnEnd('barge_in_during_open_floor');
+      if (dropped(r)) return revertTurnEnd('dropped_open_floor');
       if (r.status === 'skipped' && r.reason === 'room_active') return revertTurnEnd('room_active_at_open_floor');
       const te = flow.turnEnd;
       if (prev && state.current === prev) state.finishTurn({ t: nowMs(), status: te?.reason === 'no_speech' ? 'skipped' : 'spoke' });
@@ -984,7 +1088,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     bump();
     ev('round.closing', { reason, text: text ?? null, ...state.summary() });
     say({ key: text ? null : closingKey(), text, kind: 'closing', maxWaitMs: 15_000 }, (r) => {
-      if (r.status === 'aborted' || (r.status === 'skipped' && r.reason === 'room_active')) {
+      if (r.status === 'aborted' || (r.status === 'skipped' && r.reason === 'room_active') || dropped(r)) {
         // interrupted farewell: stay, back to the open floor (or the round), leave only when confirmed
         flow.closingStarted = false;
         flow.closingBarged = true;
@@ -998,7 +1102,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
           flow.openFloorSpeech = true;
         }
         bump();
-        ev('round.closing_reverted', { reason: r.status === 'aborted' ? 'barge_in' : 'room_active', phase: state.phase });
+        ev('round.closing_reverted', { reason: r.status === 'aborted' ? 'barge_in' : dropped(r) ? 'dropped' : 'room_active', phase: state.phase });
         return;
       }
       ev('round.closed', { status: r.status });
@@ -1105,6 +1209,15 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     clips?.setPresent?.(state.presentIds());
     bump();
     queueWarmup(diff.joined);
+    if (agentMode) {
+      // the queue is bookkeeping (the agent sees it); who speaks next is the agent's call
+      for (const id of diff.joined) {
+        if ((state.phase === 'round' || state.phase === 'open_floor') && state.get(id)?.status === 'pending') state.planInsert(id, { front: state.isLead(id) });
+        conductor?.joined(id);
+      }
+      for (const id of diff.left) conductor?.left(id);
+      return;
+    }
     for (const id of diff.joined) {
       if (state.phase === 'round' || state.phase === 'open_floor') {
         if (state.isLead(id) && state.get(id)?.status !== 'spoke') {
@@ -1239,7 +1352,10 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     if (cascade && d.track_id && !isOwnEcho(soFar, saidRecently())) {
       speechActivity(d.track_id, d.t ?? wall());
       if (hostState.speaking && interruptsHost(soFar, saidRecently())) {
-        if (floor.bargeInFrom('stt', { t: d.t ?? wall() })) ev('floor.stt_barge_in', { text: soFar.slice(0, 120), track: d.track_id.slice(0, 8) });
+        if (floor.bargeInFrom('stt', { t: d.t ?? wall() })) {
+          flow.bargeText = soFar.slice(0, 160);
+          ev('floor.stt_barge_in', { text: soFar.slice(0, 120), track: d.track_id.slice(0, 8) });
+        }
       }
     }
     floor.onSttDelta({ so_far: soFar, t: d.t ?? wall() });
@@ -1255,18 +1371,13 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
   }
 
   function questionToHost(text) {
-    if (guards.mentionsHost(text)) return 'name';
-    const present = state.presentIds().length;
-    // her «кто хочет добавить или спросить?» in a 1:1: whatever the one person says next is for her, unless it is
-    // «нет, спасибо» (live 27.09: STT gives no «?», and «а тут кто-то есть кроме меня» went unanswered)
-    if (state.phase === 'open_floor' && flow.openFloorAt !== null && present <= 1 && !foldWords(text).every((w) => NOTHING_TO_ADD.has(w))) return 'open_floor';
-    const question = looksLikeQuestion(text);
-    if (question && present <= 2) return 'small_group';
-    // a group: «ты» right after her own line is to her, even with the question word further in («а ты во сколько начнёшь»)
-    const afterOwn = flow.lastSpokenAt && wall() - flow.lastSpokenAt < OWN_UTTERANCE_WINDOW_MS;
-    if (afterOwn && YOU_RE.test(text) && (question || QUESTION_NEAR_START_RE.test(text))) return 'after_own_utterance';
-    if (question && AI_RE.test(text)) return 'about_ai';
-    return null;
+    return addressedQuestion(text, {
+      mentionsHost: guards.mentionsHost,
+      phase: state.phase,
+      openFloorAsked: flow.openFloorAt !== null,
+      present: state.presentIds().length,
+      sinceOwnLineMs: flow.lastSpokenAt ? wall() - flow.lastSpokenAt : Infinity,
+    });
   }
 
   function onSttFinal(f) {
@@ -1308,6 +1419,10 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
         ev('host.quiet_lifted', { source: 'voice', text: text.slice(0, 120) });
       }
       if (kill || state.phase === 'silent' || state.phase === 'left') return;
+      if (agentMode) {
+        conductor?.heard({ who: line.who, text, t: line.t }); // the agent decides; no start/question rules here
+        return;
+      }
       const onDemandWaiting = flow.startRequestedAt === null && !flow.roundStarted && guards.timerAt('start') === null;
       // live 27.09: «да давай начнём стендап» right after her «начну, когда попросят» went unheard for 12 s
       const replyToHost = !hostState.speaking && flow.lastSpokenAt !== null && t - flow.lastSpokenAt <= START_REPLY_WINDOW_MS;
@@ -1381,6 +1496,11 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
       ev('speech.barge_in', { run_ms: e.run_ms, source: e.source, kind, text: cur?.text ?? null, backoff_ms: e.backoff_ms });
       note('barge_in', { kind });
       const r = await abortSpeech('barge_in');
+      if (conductor) {
+        if (r) conductor.interrupted({ text: flow.bargeText ?? '' });
+        flow.bargeText = null;
+        return;
+      }
       if (r && (r.played_ratio ?? 0) < 0.3 && brain && BRAIN_ON_BARGE_KINDS.has(kind)) void think('barge_in', { priority: 'high' });
     });
   }
@@ -1406,6 +1526,12 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     const { name, late_ms } = timer;
     note('timer', { name });
     ev('timer', { name, late_ms, phase: state.phase, lead_present: state.leadPresent(), present: state.presentIds() });
+    if (agentMode && (name === 'start' || name === 'wait_lead_until' || name === 'soft_deadline')) {
+      if (name === 'soft_deadline' && state.phase === 'round') flow.wrapUpPending = true;
+      if (name === 'start' && state.phase === 'waiting') state.setPhase('starting');
+      if (!flow.roundStarted || name === 'soft_deadline') conductor?.timer(name);
+      return;
+    }
     switch (name) {
       case 'start':
         if (flow.roundStarted) return;
@@ -1480,7 +1606,8 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     serial.run(() => {
       if (done) return;
       for (const timer of guards.dueTimers(nowMs())) onTimer(timer);
-      if (!flow.roundStarted && state.phase !== 'silent') {
+      if (agentMode) conductor?.tick(t);
+      else if (!flow.roundStarted && state.phase !== 'silent') {
         if (flow.proposeAt !== null && nowMs() >= flow.proposeAt && nowMs() >= flow.holdUntil && !flow.proposalPending && !state.leadPresent()) {
           if (!brain || nowMs() >= flow.proposeAt + GREETING_GRACE_MS) {
             flow.proposeAt = nowMs() + PROPOSE_AGAIN_MS;
@@ -1493,7 +1620,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
           startRound(state.firstAlways);
         }
       }
-      openFloorTick(t);
+      if (!agentMode) openFloorTick(t);
       emptyRoomTick(t);
       if (runDeadline !== null && t >= runDeadline && !flow.maxMinutesFired) {
         flow.maxMinutesFired = true;
@@ -1531,7 +1658,30 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     }
     guards.watchStop(() => leaveNow('file')); // at once: the leave must not wait behind queued handlers
 
-    if (flags.brain !== false) {
+    if (agentMode) {
+      if (flags.brain !== false) {
+        try {
+          const make = D.createAgent ?? (await import('../agent/draft_agent.js')).agentFromSettings;
+          const agent = make({ settings, roster, log });
+          conductor = createConductor({
+            state,
+            agent,
+            io: agentIo(),
+            now: wall,
+            log,
+            leadId: state.firstAlways,
+            mentionsHost: guards.mentionsHost,
+            budget: settings.agent?.budget,
+            pricing: settings.agent?.pricing ?? null,
+            run: (fn) => serial.run(fn),
+          });
+          ev('agent.ready', { model: agent.model ?? null, provider: agent.provider ?? null });
+        } catch (e) {
+          ev('agent.disabled', { reason: e?.message ?? String(e) });
+          alert(`агент не создан: ${String(e?.message ?? e).slice(0, 160)}; она будет молчать`, 'warn');
+        }
+      } else ev('agent.disabled', { reason: '--no-brain' });
+    } else if (flags.brain !== false) {
       try {
         const { createBrain } = D.createBrain ? { createBrain: D.createBrain } : await import('../brain/client.js');
         brain = createBrain({ settings, log, dayMode });
@@ -1663,11 +1813,14 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
       D.telemost.getParticipants(page, { selfName: settings.display_name }).then((list) => serial.run(() => onParticipants(list, 'poll'))).catch(() => {});
     }, DOM_POLL_MS);
 
-    floor.on('turn_end_candidate', onTurnEnd);
-    floor.on('check_done_answered', onCheckDoneAnswered);
-    floor.on('no_speech', onNoSpeech);
+    if (!agentMode) {
+      // the turn automaton; in agent mode the silence ladder of src/agent/conductor.js wakes the agent instead
+      floor.on('turn_end_candidate', onTurnEnd);
+      floor.on('check_done_answered', onCheckDoneAnswered);
+      floor.on('no_speech', onNoSpeech);
+      floor.on('quiet', onQuiet);
+    }
     floor.on('barge_in', onBargeIn);
-    floor.on('quiet', onQuiet);
     floor.on('speech_start', onSpeechStart);
     tickTimer = setInterval(tick, TICK_MS);
 
@@ -1705,6 +1858,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     clearInterval(domPollTimer);
     clearTimeout(planRefreshTimer);
     guards.close();
+    conductor?.close();
     await abortSpeech('shutdown').catch(() => {});
     if (page && !leaving) {
       leaving = true;
@@ -1761,6 +1915,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
       reason,
       duration_min: Math.round((wall() - startedAt) / 6000) / 10,
       brain: b ? { provider: brain.provider, model: brain.model, calls: b.calls, requests: b.requests, ok: b.ok, invalid: b.invalid, errors: b.errors, prompt_tokens: b.prompt_tokens, cached_tokens: b.cached_tokens, completion_tokens: b.completion_tokens, cost_usd: round4(brainUsd) } : null,
+      ...(conductor ? { agent: { ...conductor.stats(), rub: Math.round(conductor.stats().rub * 100) / 100 } } : {}),
       voice: v ? { kind: voice.kind, ...(rt ? { realtime_usage: rt } : {}), ears: v.ears, mouth: v.mouth, cost_usd: round4(voiceUsd) } : null,
       clips: c,
       player: p,
@@ -1834,6 +1989,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
       idle: () => serial.idle(),
       current: () => currentSpeech,
       queued: () => queuedKinds(),
+      conductor: () => conductor,
     },
   };
 }

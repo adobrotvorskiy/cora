@@ -100,6 +100,25 @@ test('validateSettings checks the voice section', () => {
   assert.ok(validateSettings(t).errors.includes('settings.voice is missing'));
 });
 
+test('validateSettings: voice.host agent needs the AI Studio folder and ears; agent settings are checked', () => {
+  const s = { ...committed(), meeting_url: 'https://telemost.yandex.ru/j/11111111111111111111111111111111111111' };
+  s.voice.host = 'agent';
+  s.yandex = { folder: 'folder-x' };
+  s.agent = { model: 'aliceai-llm-flash/latest', timeout_ms: 8000, budget: { max_calls: 600 }, pricing: null };
+  assert.deepEqual(validateSettings(s).errors, []);
+  delete s.yandex;
+  s.voice.provider = 'elevenlabs_agent';
+  s.agent = { timeout_ms: 'soon', budget: 3 };
+  const { errors } = validateSettings(s);
+  assert.ok(errors.includes('yandex.folder must be the cloud folder id for voice.host agent'));
+  assert.ok(errors.includes('voice.host agent needs ears and a mouth (yandex_cascade or openrouter), not elevenlabs_agent'));
+  assert.ok(errors.includes('agent.timeout_ms must be a number'));
+  assert.ok(errors.includes('agent.budget must be an object {max_calls, max_tokens, max_rub}'));
+  const t = committed();
+  t.voice.host = 'robot';
+  assert.ok(validateSettings(t).errors.includes('voice.host must be automaton|agent'));
+});
+
 test('validateSettings catches broken times, URL and speed', () => {
   const s = committed();
   s.times.hard_deadline = '10:20'; // before soft_deadline 10:28
