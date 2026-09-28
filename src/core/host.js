@@ -61,6 +61,7 @@ const GREETING_GRACE_MS = 45_000;
 const SILENCE_THINK_MIN_MS = 10_000;
 const SPEAK_WAIT_MS = 8000;
 const ADDRESSED_FORCE_MS = 2000; // yandex_cascade: asked by name -> at most this long waiting for a quiet room
+const AGENT_SAID_ACK_MS = 10_000; // agent mode: her own line this recent stands for the «Спасибо, X!» clip
 const LEAVE_TIMEOUT_MS = 8000;
 const JOIN_RETRIES = 2; // «Звонки сейчас недоступны»: join again from the link
 const JOIN_RETRY_PAUSE_MS = 5000;
@@ -277,6 +278,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     startPending: false, // the opening line is queued / playing (the round starts when it ends)
     orphanSince: null, // agent mode: since when a flow waits for a line that is gone (healAgentFlows)
     lastAckFor: null, // agent mode: the ack «Спасибо, X!» already played for X (a re-decided handoff does not thank twice)
+    lastAgentSayAt: null, // agent mode: when her last agent_say ended (no ack clip right after her own words)
     bargeText: null, // the recognized words that stopped her (agent: the interrupted event)
     turnEnd: null, // {at, prev, to, reason, phase} while a turn-end playback (ack/handoff/open floor) is in flight
     maxMinutesFired: false,
@@ -416,7 +418,10 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     if (conductor) {
       // agent mode: a line carries the epoch of the decision behind it; a newer event drops it (dropAgentLines)
       spec.agentEpoch ??= agentExec ?? (AGENT_FLOW_KINDS.has(spec.kind) ? (flow.turnEnd?.agentEpoch ?? null) : null);
-      if (spec.agentEpoch != null && spec.agentEpoch < conductor.epoch) spec.superseded = true;
+      // a leave raises the epoch but does not make her other lines stale (review 28.09): lineEpoch
+      if (spec.agentEpoch != null && spec.agentEpoch < (conductor.lineEpoch ?? conductor.epoch)) spec.superseded = true;
+      // the lines of a turn change belong to it: its revert removes them and nothing newer (review 28.09)
+      if (flow.turnEnd && AGENT_FLOW_KINDS.has(spec.kind)) spec.te ??= flow.turnEnd;
     }
     const item = { spec, after };
     if (front) speechQueue.unshift(item);
@@ -532,7 +537,8 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
       return { status: 'suppressed', reason: late.reason, text, played_ratio: 0 };
     }
     const waitMs = wall() - t0;
-    if (!clip) {
+    if (!clip && !conductor) {
+      // the old brain's cap (60 live lines); the agent counts its calls and tokens itself (review 28.09: it went silent after 60)
       const lim = guards.liveReadoutAllowed();
       if (!lim.ok) {
         ev('speech.skipped', { reason: lim.reason, text });
@@ -553,8 +559,11 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
         : typeof player.playLive === 'function'
           ? player.playLive(voice.mouth, text, { meta: { ...meta, source: 'live' }, interrupt: true })
           : playLive(text, meta);
-      currentSpeech = { handle, spec, text, startedAt: wall(), source: clip ? 'clip' : 'live' };
-      result = normalizeResult(await handle.done);
+      let kill = null;
+      const killed = new Promise((r) => (kill = r));
+      currentSpeech = { handle, spec, text, startedAt: wall(), source: clip ? 'clip' : 'live', kill };
+      // an abort whose playback never reports its end must not keep her «speaking» for good (review 28.09)
+      result = normalizeResult(await Promise.race([handle.done, killed]));
     } catch (e) {
       result = { status: 'failed', error: e?.message ?? String(e), played_ratio: 0, code: e?.code ?? null };
       ev('speech.error', { key: spec.key ?? null, text, message: result.error, code: result.code });
@@ -567,6 +576,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     said.completed = result.status === 'completed';
     ownLine.cut = result.status === 'aborted';
     if (result.status === 'completed') flow.lastSpokenAt = wall();
+    if (result.status === 'completed' && meta.kind === 'agent_say') flow.lastAgentSayAt = wall();
     if (conductor && (result.status === 'completed' || result.status === 'aborted')) conductor.herLine({ text, cut: result.status === 'aborted', kind: meta.kind, t: wall() });
     ev(result.status === 'aborted' ? 'speech.abort' : 'speech.end', {
       status: result.status,
@@ -636,7 +646,9 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     try {
       const p = cur.handle.abort(reason);
       if (p && typeof p.catch === 'function') p.catch(() => {});
-      return normalizeResult(await Promise.race([cur.handle.done, sleep(3000).then(() => ({ status: 'aborted', reason: 'abort_timeout' }))]));
+      const r = normalizeResult(await Promise.race([cur.handle.done, sleep(3000).then(() => ({ status: 'aborted', reason: 'abort_timeout' }))]));
+      if (r.reason === 'abort_timeout') cur.kill?.(r);
+      return r;
     } catch (e) {
       ev('speech.error', { where: 'abort', message: e?.message ?? String(e) });
       return null;
@@ -664,11 +676,17 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
 
   // ------------------------------------------------------------------------------------- agent
 
-  /** Agent mode: her lines still waiting (queued or at the floor gate) with an epoch older than `epoch` are dropped. */
-  function dropAgentLines(epoch) {
+  /**
+   * Agent mode: her lines still waiting (queued or at the floor gate) with an epoch older than `epoch` are dropped;
+   * with `person` (someone left) only the lines to that person (review 28.09: a colleague leaving dropped a handoff).
+   */
+  function dropAgentLines(epoch, person = null) {
     let n = 0;
-    // an answer to her name plays within forceAfterMs whatever follows: dropping it would lose the answer (review 27.09)
-    const hit = (spec) => spec && spec.agentEpoch != null && spec.agentEpoch < epoch && !spec.superseded && !(spec.kind === 'agent_say' && spec.forceAfterMs);
+    // an answer to her name (or the opening line asked by name) plays within forceAfterMs whatever follows:
+    // dropping it would lose the answer (review 27.09, 28.09)
+    const asked = (spec) => spec.forceAfterMs && (spec.kind === 'agent_say' || spec.kind === 'start');
+    const to = (spec) => !person || spec.person === person || spec.meta?.to === person;
+    const hit = (spec) => spec && spec.agentEpoch != null && spec.agentEpoch < epoch && !spec.superseded && !asked(spec) && to(spec);
     for (const item of speechQueue) {
       if (hit(item.spec)) {
         item.spec.superseded = true;
@@ -705,19 +723,30 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
       if (o.silentPrev) flow.turnEnd.prevSilent = true;
       if (phase) flow.turnEnd.phase = phase;
     };
+    // her own words ended the turn a moment ago («Спасибо, Тима, понятно»): no «Спасибо» clip on top (review 28.09)
+    const saidLately = () => flow.lastAgentSayAt != null && wall() - flow.lastAgentSayAt <= AGENT_SAID_ACK_MS;
+    const waitingLines = () => [...speechQueue.map((i) => i.spec), gateSpec, currentSpeech?.spec].filter(Boolean);
     return {
       say: ({ text: t, how, epoch }) => {
+        if (quiet) return { ok: false, reason: 'quiet' };
         const line = text(t);
         if (!line) return { ok: false, reason: 'empty_text' };
+        // the same answer decided twice (a newer line re-woke her while the first waited at the gate): once (review 28.09)
+        if (waitingLines().some((sp) => sp.kind === 'agent_say' && !sp.superseded && sameLine(sp.text ?? '', line))) {
+          ev('speech.dropped', { reason: 'duplicate', text: line });
+          return { ok: true };
+        }
         // asked by name: a room that never goes quiet must not keep the answer back (CLAUDE.md, 26.09)
         return asAgent(epoch, () => say({ text: line, kind: 'agent_say', meta: { how: how ?? null }, ...(cascade && how === 'name' ? { forceAfterMs: ADDRESSED_FORCE_MS } : {}) }));
       },
       startRound: ({ person, text: t, how, epoch }) => {
+        if (quiet) return { ok: false, reason: 'quiet' };
         if (flow.roundStarted) return { ok: false, reason: 'round_started' };
         if (how === 'name') flow.startRequestedAt ??= nowMs(); // «Кора, начинай»: the opening line may not wait for a noisy room
         return asAgent(epoch, () => startRound(person, text(t)));
       },
       giveWord: (o) => {
+        if (quiet) return { ok: false, reason: 'quiet' };
         const busy = busyTurn();
         if (busy) return busy;
         if (!flow.roundStarted) return asAgent(o.epoch, () => startRound(o.person, text(o.text)));
@@ -730,7 +759,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
           const prev = state.current;
           const prevGone = prev && !state.get(prev)?.present;
           // no «Спасибо, X!» clip: her own words, she has just spoken, X said nothing, X left, or X was thanked already
-          if (o.text || o.said || o.silentPrev || prevGone || (prev && flow.lastAckFor === prev)) handoff(o.person, text(o.text), { reason: 'agent', plain: !o.text });
+          if (o.text || o.said || saidLately() || o.silentPrev || prevGone || (prev && flow.lastAckFor === prev)) handoff(o.person, text(o.text), { reason: 'agent', plain: !o.text });
           else {
             state.planInsert(o.person, { front: true });
             endTurnSequence('agent');
@@ -740,22 +769,25 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
       },
       askDone: ({ person, epoch }) => asAgent(epoch, () => say({ key: 'check_done', person, kind: 'check_done' })),
       openFloor: (o) => {
+        if (quiet) return { ok: false, reason: 'quiet' };
         const busy = busyTurn();
         if (busy) return busy;
         if (state.phase !== 'round') return { ok: false, reason: 'not_in_round' };
         return asAgent(o.epoch, () => {
           state.setPlan({ next: null, then: [] });
           const prev = state.current;
-          if (!prev || !state.get(prev)?.present || o.said || o.silentPrev || flow.lastAckFor === prev) openFloor('agent');
+          if (!prev || !state.get(prev)?.present || o.said || saidLately() || o.silentPrev || flow.lastAckFor === prev) openFloor('agent');
           else endTurnSequence('agent');
           markTurnEnd(o, null);
         });
       },
       leave: ({ text: t, epoch }) => {
         if (flow.closingStarted) return { ok: false, reason: 'closing' };
+        // a turn change still playing is dropped, not reverted: its revert would undo the farewell (review 28.09)
+        if (flow.turnEnd) cancelTurnEnd('leave');
         return asAgent(epoch, () => startClosing('agent', text(t)));
       },
-      drop: dropAgentLines,
+      drop: (epoch, person) => dropAgentLines(epoch, person),
       roomSpeaking: () => floor.active || floor.vadOpen,
       lit: () => litIds,
       hostBusy: () => hostState.speaking || Boolean(currentSpeech) || speechQueue.length > 0 || Boolean(gateSpec) || Boolean(flow.turnEnd),
@@ -763,6 +795,22 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
       quiet: () => quiet,
       alert: (t) => alert(t, 'warn'),
     };
+  }
+
+  /** Agent mode: a newer decision replaces the turn change in progress — its lines are dropped, nothing is undone. */
+  function cancelTurnEnd(why) {
+    const te = flow.turnEnd;
+    if (!te) return;
+    flow.turnEnd = null;
+    let n = 0;
+    for (const sp of [...speechQueue.map((i) => i.spec), gateSpec]) {
+      if (sp && sp.te === te && !sp.superseded) {
+        sp.superseded = true;
+        n++;
+      }
+    }
+    floor.resumeTurn();
+    ev('turn.end_cancelled', { why, who: te.prev ?? null, to: te.to ?? null, dropped: n });
   }
 
   /**
@@ -983,12 +1031,15 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     const asked = cascade && flow.startRequestedAt !== null; // «Кора, начинай»: people are waiting for her
     say({ key: text ? null : key, text, person: id, kind: 'start', maxWaitMs: 15_000, ...(asked ? { forceAfterMs: ADDRESSED_FORCE_MS } : {}) }, (r) => {
       flow.startPending = false;
-      if (dropped(r)) {
-        // agent mode: people spoke again before the opening line played — the agent decides anew
+      // agent mode: people spoke again before the opening line played, or the first speaker left while it
+      // played (review 28.09: a turn given to someone absent) — the agent decides anew
+      const gone = agentMode && !state.get(id)?.present;
+      if (dropped(r) || gone) {
         flow.roundStarted = false;
         state.setPhase('waiting');
         bump();
-        ev('round.start_dropped', { first: id });
+        ev('round.start_dropped', { first: id, why: gone ? 'left' : 'superseded' });
+        conductor?.undone?.({ what: 'start', why: gone ? 'left' : 'superseded' });
         return;
       }
       if (r.status === 'suppressed' || r.status === 'failed') ev('round.start_unspoken', { status: r.status });
@@ -1024,7 +1075,8 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     const plan = state.ensurePlan();
     const to = plan.next;
     const withAck = engagement.ack !== false && Boolean(prev) && !['no_speech', 'speaker_left'].includes(reason);
-    flow.turnEnd = { at: wall(), prev, to, reason, phase: state.phase };
+    const te = { at: wall(), prev, to, reason, phase: state.phase };
+    flow.turnEnd = te;
     note('turn_end', { who: prev, reason, to });
     ev('turn.end', { who: prev, reason, to, ack: withAck, plan });
     const proceed = () => {
@@ -1037,9 +1089,11 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     };
     if (!withAck) return proceed();
     say(ackSpecFor(prev), (r) => {
+      if (agentMode && flow.turnEnd !== te) return; // a newer decision replaced this turn change (review 28.09)
+      // mostly heard is heard: a re-decided handoff does not thank again (review 28.09)
+      if (r.status === 'completed' || r.status === 'shadow' || (r.status === 'aborted' && (r.played_ratio ?? 0) >= 0.5)) flow.lastAckFor = prev;
       if (r.status === 'aborted') return revertTurnEnd('barge_in_during_ack');
       if (dropped(r)) return revertTurnEnd('dropped_ack');
-      if (r.status === 'completed' || r.status === 'shadow') flow.lastAckFor = prev;
       proceed();
     });
   }
@@ -1055,15 +1109,17 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     if (done || state.phase !== 'round') return;
     const prev = state.current;
     if (!flow.turnEnd) flow.turnEnd = { at: wall(), prev, to, reason, phase: state.phase };
+    const te = flow.turnEnd;
     const key = handoffKey(to, plain);
     ev('turn.handoff', { from: prev, to, key, reason, text: text ?? null });
     say({ key: text ? null : key, text, person: to, kind: 'handoff', gapBeforeMs: gap ? ACK_GAP_MS : 0, meta: { from: prev, to } }, (r) => {
+      if (agentMode && flow.turnEnd !== te) return; // a newer decision replaced this turn change (review 28.09)
       if (r.status === 'aborted') return revertTurnEnd('barge_in_during_handoff');
       if (dropped(r)) return revertTurnEnd('dropped_handoff');
       if (r.status === 'skipped' && r.reason === 'room_active') return postponeTurnEnd(to);
       if (agentMode && state.phase !== 'round') return revertTurnEnd('phase_changed'); // the round was undone while the handoff waited
-      const te = flow.turnEnd;
-      if (prev && state.current === prev) state.finishTurn({ t: nowMs(), status: prevStatus(prev, te) });
+      if (agentMode && !state.get(to)?.present) return revertTurnEnd('target_left'); // review 28.09: never a turn for someone absent
+      if (prev && state.current === prev) state.finishTurn({ t: nowMs(), status: prevStatus(prev, flow.turnEnd) });
       beginTurn(to);
     });
   }
@@ -1072,17 +1128,18 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     if (done) return;
     const prev = state.current;
     if (!flow.turnEnd) flow.turnEnd = { at: wall(), prev, to: null, reason, phase: state.phase };
+    const te = flow.turnEnd;
     state.setPhase('open_floor');
     flow.openFloorAt = null;
     flow.openFloorSpeech = false;
     bump();
     ev('round.open_floor', { reason, ...state.summary() });
     say({ key: 'open_floor', kind: 'open_floor', maxWaitMs: 20_000 }, (r) => {
+      if (agentMode && flow.turnEnd !== te) return; // a newer decision replaced this turn change (review 28.09)
       if (r.status === 'aborted') return revertTurnEnd('barge_in_during_open_floor');
       if (dropped(r)) return revertTurnEnd('dropped_open_floor');
       if (r.status === 'skipped' && r.reason === 'room_active') return revertTurnEnd('room_active_at_open_floor');
-      const te = flow.turnEnd;
-      if (prev && state.current === prev) state.finishTurn({ t: nowMs(), status: prevStatus(prev, te) });
+      if (prev && state.current === prev) state.finishTurn({ t: nowMs(), status: prevStatus(prev, flow.turnEnd) });
       floor.endTurn();
       attribution.setPresumed(null);
       flow.turnEnd = null;
@@ -1105,19 +1162,24 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
   function revertTurnEnd(why) {
     const te = flow.turnEnd;
     flow.turnEnd = null;
-    clearSpeechQueue('turn_end_reverted');
-    if (te?.phase && state.phase !== te.phase) state.setPhase(te.phase);
-    if (te?.prev) {
-      if (state.get(te.prev)?.present && state.current !== te.prev) {
-        state.setStatus(te.prev, 'speaking');
-      }
+    // agent mode: only this turn change's lines go; an answer or a farewell decided later stays (review 28.09)
+    const closing = agentMode && flow.closingStarted;
+    if (agentMode) {
+      const own = speechQueue.filter((i) => i.spec.te && i.spec.te === te);
+      for (const i of own) speechQueue.splice(speechQueue.indexOf(i), 1);
+      if (own.length) ev('speech.dropped', { reason: 'turn_end_reverted', count: own.length, keys: own.map((i) => i.spec.key ?? i.spec.kind) });
+    } else clearSpeechQueue('turn_end_reverted');
+    if (!closing && te?.phase && state.phase !== te.phase) state.setPhase(te.phase);
+    if (te?.prev && state.get(te.prev)?.present) {
+      if (state.current !== te.prev) state.setStatus(te.prev, 'speaking');
       attribution.setPresumed(te.prev);
     }
-    if (te?.to && te.to !== state.current) state.planInsert(te.to, { front: true });
+    if (te?.to && te.to !== state.current && state.get(te.to)?.present) state.planInsert(te.to, { front: true });
     floor.resumeTurn();
     flow.lastCheckDoneFor = null;
     flow.openFloorAt = null;
-    flow.closingStarted = false;
+    if (!closing) flow.closingStarted = false;
+    conductor?.undone?.({ what: 'turn_change', why });
     bump();
     note('turn_end_reverted', { who: te?.prev ?? null, why });
     ev('turn.end_reverted', { why, who: te?.prev ?? null, to: te?.to ?? null, phase: state.phase, plan: state.plan });
@@ -1866,6 +1928,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
       joinRes = await joinOnce();
     }
     ev('join.result', joinRes);
+    if (joinRes.status !== 'joined' && done) return done.code; // Ctrl+C while joining: not a failure (review 28.09)
     if (joinRes.status !== 'joined') {
       alert(`не удалось войти в комнату: ${joinRes.status} (${String(joinRes.detail ?? '').slice(0, 160)}), лог ${log.path}`);
       return EXIT.error;

@@ -7,6 +7,7 @@
 //   c.heard({who, text, t})          a final line (after stt_fixes, her echo filtered, speaker attributed)
 //   c.herLine({text, cut, kind, t})  her line ended (completed, or cut by a barge-in)
 //   c.interrupted({text}) · c.chorus({who}) · c.joined(id) · c.left(id) · c.timer(name)
+//   c.undone({what, why})            the host undid her turn change / opening line (the agent hears it)
 //   c.tick(t)                        every host tick: the silence ladder, re-wakes, the end of a held wake
 //
 // Wake -> agent.decide(input, {signal}) -> tool calls -> executor: invariants (src/agent/invariants.js
@@ -66,7 +67,7 @@ const TURN_TOOLS = new Set(['give_word', 'ask_done', 'open_floor', 'leave']);
  * «Not yet» refusals: the same call is right a bit later, so repeating it never marks the agent stuck and
  * earns no extra wake right away (live 28.09, run 2: `too_early` on every line silenced the real «всё?»).
  */
-const TIMING = new Set(['too_early', 'too_often', 'start_pending', 'turn_change_in_progress', 'closing', 'speaker_not_started', 'not_started', 'already_asked', 'repeat']);
+const TIMING = new Set(['too_early', 'too_often', 'start_pending', 'turn_change_in_progress', 'closing', 'speaker_not_started', 'not_started', 'already_asked', 'repeat', 'quiet']);
 /** Two identical refusals count as «stuck» only this close together (review 28.09: not across minutes of skips). */
 const STUCK_WINDOW_MS = 30_000;
 /** Before the round, after her own line: one silence wake (review 28.09: «Кора, начинай» answered by a say, then nothing). */
@@ -259,6 +260,11 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
     if ((kind === 'start' || kind === 'handoff') && !cut) wordGivenAt = t;
     if (!cut && (kind === 'agent_say' || kind === 'start' || kind === 'handoff') && lastAddressed && lastAddressed.t <= t) lastAddressed = null; // answered
     resetLadder(t);
+  }
+
+  /** The host undid what she started (a turn change reverted, the opening line dropped): the agent hears it next time. */
+  function undone({ what, why = null } = {}) {
+    push({ type: 'undone', what, ...(why ? { why } : {}) });
   }
 
   function interrupted({ text = '' } = {}) {
@@ -639,6 +645,7 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
     seedDialog,
     heard,
     herLine,
+    undone,
     interrupted,
     chorus,
     joined,

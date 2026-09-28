@@ -103,7 +103,7 @@ function fakeMouth() {
   };
 }
 
-function makeHost({ present = [], brainScript = null, brainHang = false, flags = {}, voiceConnectError = false, onDemand = false, prefetch = false, agent = null, deps: extraDeps = {} } = {}) {
+function makeHost({ present = [], brainScript = null, brainHang = false, flags = {}, voiceConnectError = false, onDemand = false, prefetch = false, agent = null, settings: settingsOverride = null, deps: extraDeps = {} } = {}) {
   const t = { now: 1_000_000 };
   const now = () => t.now;
   const events = [];
@@ -196,6 +196,7 @@ function makeHost({ present = [], brainScript = null, brainHang = false, flags =
   };
   let settings = onDemand ? { ...SETTINGS, times: null } : SETTINGS;
   if (agent) settings = { ...settings, voice: { host: 'agent' } };
+  if (settingsOverride) settings = { ...settings, ...settingsOverride, voice: { ...(settings.voice ?? {}), ...(settingsOverride.voice ?? {}) } };
   const host = createHost({ settings, flags: { brain: Boolean(brain || agent), alert: false, ...flags }, log, deps });
   const run = host.run();
   const api = {
@@ -1134,6 +1135,191 @@ describe('host: agent mode, a lit tile (28.09)', () => {
     assert.deepEqual(agent.calls[0].input.events.filter((e) => e.type === 'heard').map((e) => e.text), ['Кора, привет', 'как у тебя дела']);
     assert.deepEqual(h.player.plays.map((p) => p.meta.text), ['Привет, Тима!']);
     assert.equal(h.find('agent.held')[0].why, 'dark');
+    await h.finish();
+  });
+});
+
+// yandex_cascade: the room is busy only from a partial to its final; barge-in only by recognized speech
+const CASCADE = { voice: { provider: 'yandex_cascade' } };
+const delta = (h, id, track, text) => h.ears.emit('stt_delta', { item_id: id, track_id: track, so_far: text, text, t: h.t.now });
+const finalTrack = (h, id, track, text) => h.ears.emit('stt_final', { item_id: id, track_id: track, text, t: h.t.now, t_speech_start: h.t.now - 1000, t_speech_end: h.t.now });
+
+describe('host: agent mode after the code review of 28.09', () => {
+  const startThen = (rest) => (input) => {
+    const text = lastHeard(input);
+    if (/начинай/.test(text)) return [{ action: 'give_word', person: 'tkach_t', text: 'Доброе утро! Тима, начнёшь?' }];
+    return rest(input, text);
+  };
+
+  test('«Кора, заканчивай» while her say plays and the handoff waits: the farewell stays, she leaves', async () => {
+    const agent = scriptAgent(
+      startThen((input, text) => {
+        if (/у меня всё/.test(text) && input.speaker === 'tkach_t') return [{ action: 'say', text: 'Спасибо, Тима, понятно.' }, { action: 'give_word', person: 'nevsky_g', text: '' }];
+        if (/заканчивай/.test(text)) return [{ action: 'leave', text: 'Всем хорошего дня, пока!' }];
+        return [{ action: 'skip' }];
+      }),
+    );
+    const h = makeHost({ present: ['Тимур Ткач', 'Глеб Невский'], onDemand: true, agent, settings: CASCADE });
+    await h.ready();
+    final(h, 'a1', 'Кора, начинай');
+    await h.advance(1500, QUIET);
+    h.player.auto = 0; // her say keeps playing
+    finalTrack(h, 'a2', 'trackA', 'сегодня тесты у меня всё');
+    await h.advance(1200, QUIET);
+    assert.deepEqual(h.host._test.queued(), ['handoff']);
+    delta(h, 'a3', 'trackA', 'Кора'); // one word: no barge-in
+    await h.settle(60);
+    finalTrack(h, 'a3', 'trackA', 'Кора, заканчивай встречу');
+    await h.advance(300, QUIET);
+    assert.equal(h.host.phase, 'closing');
+    assert.deepEqual(h.find('turn.end_cancelled').map((e) => e.why), ['leave'], 'the old turn change is dropped (its handoff was already stale), not reverted');
+    h.player.plays.at(-1).complete();
+    h.player.auto = 30;
+    await h.advance(1500, QUIET);
+    assert.equal(h.find('turn.end_reverted').length, 0, 'nothing undone');
+    assert.equal(h.player.plays.at(-1).meta.text, 'Всем хорошего дня, пока!');
+    assert.equal(await h.run, 0);
+    assert.equal(h.find('host.finish')[0].reason, 'closing:agent');
+  });
+
+  test('a bystander leaves while «Спасибо, Тима!» plays: the handoff to Gleb still plays', async () => {
+    const agent = scriptAgent(startThen((input, text) => (/у меня всё/.test(text) && input.speaker === 'tkach_t' ? [{ action: 'give_word', person: 'nevsky_g', text: '' }] : [{ action: 'skip' }])));
+    const h = makeHost({ present: ['Тимур Ткач', 'Глеб Невский', 'Сергей Белозерский'], onDemand: true, agent });
+    await h.ready();
+    final(h, 'b1', 'Кора, начинай');
+    await h.advance(1500, QUIET);
+    h.player.auto = 0;
+    final(h, 'b2', 'сегодня тесты у меня всё');
+    await h.advance(600, QUIET);
+    assert.equal(h.player.plays.at(-1).meta.key, 'ack');
+    h.setTiles(['Тимур Ткач', 'Глеб Невский']); // Sergey leaves
+    await h.settle(150);
+    h.player.plays.at(-1).complete();
+    h.player.auto = 30;
+    await h.advance(1000, QUIET);
+    assert.equal(h.find('turn.end_reverted').length, 0);
+    assert.equal(h.host.state.current, 'nevsky_g');
+    await h.finish();
+  });
+
+  test('a bystander leaves while her own «Спасибо» plays and the handoff is queued: the handoff stays', async () => {
+    const agent = scriptAgent(startThen((input, text) => (/у меня всё/.test(text) && input.speaker === 'tkach_t' ? [{ action: 'say', text: 'Спасибо, Тима, понятно.' }, { action: 'give_word', person: 'nevsky_g', text: '' }] : [{ action: 'skip' }])));
+    const h = makeHost({ present: ['Тимур Ткач', 'Глеб Невский', 'Сергей Белозерский'], onDemand: true, agent });
+    await h.ready();
+    final(h, 'b1', 'Кора, начинай');
+    await h.advance(1500, QUIET);
+    h.player.auto = 0;
+    final(h, 'b2', 'сегодня тесты у меня всё');
+    await h.advance(600, QUIET);
+    assert.deepEqual(h.host._test.queued(), ['handoff']);
+    h.setTiles(['Тимур Ткач', 'Глеб Невский']); // Sergey leaves: only lines to him would go
+    await h.settle(150);
+    h.player.plays.at(-1).complete();
+    h.player.auto = 30;
+    await h.advance(1000, QUIET);
+    assert.equal(h.find('turn.end_reverted').length, 0);
+    assert.equal(h.host.state.current, 'nevsky_g');
+    await h.finish();
+  });
+
+  test('the speaker himself leaves while «Спасибо, Тима!» plays: the handoff to Gleb plays, no absent speaker restored', async () => {
+    const agent = scriptAgent(startThen((input, text) => (/у меня всё/.test(text) && input.speaker === 'tkach_t' ? [{ action: 'give_word', person: 'nevsky_g', text: '' }] : [{ action: 'skip' }])));
+    const h = makeHost({ present: ['Тимур Ткач', 'Глеб Невский'], onDemand: true, agent, settings: CASCADE });
+    await h.ready();
+    final(h, 'f1', 'Кора, начинай');
+    await h.advance(1500, QUIET);
+    h.player.auto = 0;
+    finalTrack(h, 'f2', 'trackA', 'сегодня тесты у меня всё');
+    await h.advance(600, QUIET);
+    h.setTiles(['Глеб Невский']);
+    await h.settle(150);
+    h.player.plays.at(-1).complete();
+    h.player.auto = 30;
+    await h.advance(1000, QUIET);
+    assert.equal(h.find('turn.end_reverted').length, 0);
+    assert.equal(h.host.state.current, 'nevsky_g');
+    await h.finish();
+  });
+
+  test('she thanked in one decision and hands over in the next: no «Спасибо» clip on top', async () => {
+    let thanked = false;
+    const agent = scriptAgent(
+      startThen((input, text) => {
+        if (/у меня всё/.test(text) && input.speaker === 'tkach_t' && !thanked) {
+          thanked = true;
+          return [{ action: 'say', text: 'Спасибо, Тима, понятно.' }];
+        }
+        if (input.speaker === 'tkach_t' && thanked && input.events.some((e) => e.type === 'silence')) return [{ action: 'give_word', person: 'nevsky_g', text: '' }];
+        return [{ action: 'skip' }];
+      }),
+    );
+    const h = makeHost({ present: ['Тимур Ткач', 'Глеб Невский'], onDemand: true, agent });
+    await h.ready();
+    final(h, 'c1', 'Кора, начинай');
+    await h.advance(1500, QUIET);
+    final(h, 'c2', 'сегодня тесты у меня всё');
+    await h.advance(4000, QUIET);
+    assert.deepEqual(h.player.plays.slice(1).map((p) => p.meta.key ?? p.meta.text), ['Спасибо, Тима, понятно.', 'handoff_plain']);
+    assert.equal(h.host.state.current, 'nevsky_g');
+    await h.finish();
+  });
+
+  test('the opening line asked by name waits for a busy room: an «ага» does not drop it', async () => {
+    const agent = scriptAgent((input) => (/начинай/.test(lastHeard(input)) ? [{ action: 'give_word', person: 'tkach_t', text: 'Доброе утро! Тима, начнёшь?' }] : [{ action: 'skip' }]));
+    const h = makeHost({ present: ['Тимур Ткач', 'Глеб Невский'], onDemand: true, agent, settings: CASCADE });
+    await h.ready();
+    delta(h, 'e0', 'trackB', 'ну я вчера делал'); // Gleb is talking
+    await h.settle(60);
+    finalTrack(h, 'e1', 'trackA', 'Кора, начинай');
+    await h.advance(300, QUIET);
+    delta(h, 'e2', 'trackB', 'ну я вчера делал ревью');
+    await h.advance(300, QUIET);
+    finalTrack(h, 'e2', 'trackB', 'ага');
+    await h.advance(3000, QUIET);
+    assert.equal(h.find('round.start_dropped').length, 0);
+    assert.equal(h.player.plays.at(-1)?.meta.text, 'Доброе утро! Тима, начнёшь?');
+    assert.equal(h.host.state.current, 'tkach_t');
+    await h.finish();
+  });
+
+  test('the first speaker leaves while the opening line plays: the start is undone, nobody absent gets the word', async () => {
+    const agent = scriptAgent(startThen(() => [{ action: 'skip' }]));
+    const h = makeHost({ present: ['Тимур Ткач', 'Глеб Невский'], onDemand: true, agent });
+    await h.ready();
+    h.player.auto = 0;
+    final(h, 'l1', 'Кора, начинай');
+    await h.advance(600, QUIET);
+    assert.equal(h.player.plays.at(-1)?.meta.kind, 'start');
+    h.setTiles(['Глеб Невский']);
+    await h.settle(150);
+    h.player.plays.at(-1).complete();
+    h.player.auto = 30;
+    await h.advance(500, QUIET);
+    assert.deepEqual(h.find('round.start_dropped').map((e) => e.why), ['left']);
+    assert.equal(h.host.phase, 'waiting');
+    assert.notEqual(h.host.state.current, 'tkach_t');
+    assert.ok(h.host._test.conductor().input().events.some((e) => e.type === 'undone' && e.what === 'start'), 'the agent hears it');
+    await h.finish();
+  });
+
+  test('an answer by name decided twice (a newer line re-woke her while it waited) plays once', async () => {
+    const agent = scriptAgent((input) => {
+      const asked = input.dialog.some((l) => /Кора, ты тут/.test(l.text));
+      const answered = input.dialog.some((l) => l.who === 'host' && /Я тут/.test(l.text) && !l.cut);
+      return asked && !answered ? [{ action: 'say', text: 'Я тут, слушаю.' }] : [{ action: 'skip' }];
+    });
+    const h = makeHost({ present: ['Тимур Ткач', 'Глеб Невский'], onDemand: true, agent, settings: CASCADE });
+    await h.ready();
+    delta(h, 'q2', 'trackB', 'ну я вчера');
+    await h.advance(200, QUIET);
+    finalTrack(h, 'q1', 'trackA', 'Кора, ты тут');
+    await h.advance(300, QUIET);
+    delta(h, 'q2', 'trackB', 'ну я вчера делал ревью');
+    await h.advance(300, QUIET);
+    finalTrack(h, 'q2', 'trackB', 'ну я вчера делал ревью');
+    await h.advance(4000, QUIET);
+    assert.deepEqual(h.player.plays.map((p) => p.meta.text), ['Я тут, слушаю.']);
+    assert.ok(h.find('speech.dropped').some((e) => e.reason === 'duplicate'));
     await h.finish();
   });
 });
