@@ -2,7 +2,7 @@
 // prompt per phase under ~3k tokens, the phase prompt in the request.
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
-import { agentFromSettings, agentPrompts, createDraftAgent, withFallback } from '../../src/agent/draft_agent.js';
+import { agentFromSettings, agentPrompts, createDraftAgent, toolsFor, withFallback } from '../../src/agent/draft_agent.js';
 import { playbookSkills } from '../../src/agent/skills.js';
 import { estimateTokens } from '../../src/brain/context.js';
 import { loadBrainAssets } from '../../src/brain/prompt.js';
@@ -193,5 +193,45 @@ describe('skills: the playbook by phase', () => {
     assert.deepEqual(bodies[1].reasoning, { effort: 'low' });
     assert.equal(bodies[0].reasoning_effort, undefined);
     assert.equal(bodies[0].max_tokens, 2048);
+  });
+
+  test('review 28.09: the fallback does not inherit agent.endpoint; a secondary failing in the cooldown ends it', async () => {
+    const urls = [];
+    const fetch = async (url) => {
+      urls.push(url);
+      if (/proxy\.example/.test(url)) return new Response('{"error":{"code":503}}', { status: 503 });
+      return new Response(JSON.stringify({ choices: [{ message: { tool_calls: [{ id: 'a', type: 'function', function: { name: 'skip', arguments: '{}' } }] } }] }), { headers: { 'content-type': 'application/json' } });
+    };
+    const settings = { keys: { google: 'X_G', yandex: 'X_Y' }, yandex: { folder: 'f1' }, brain: { google_model: 'g', yandex_model: 'y' }, agent: { provider: 'google', endpoint: 'https://proxy.example/v1/chat/completions' }, voice: {} };
+    const agent = agentFromSettings({ settings, roster: { people: [] }, env: { X_G: 'kg', X_Y: 'ky' }, fetch, assets: { people: [], playbook: null, personaBlock: null } });
+    await agent.decide({ phase: 'waiting', present: ['a'], events: [] });
+    assert.match(urls[1], /ai\.api\.cloud\.yandex\.net/, 'the Yandex fallback goes to Yandex, with the Yandex key');
+
+    const t = { now: 0 };
+    let primaryFail = Object.assign(new Error('HTTP 503'), { status: 503 });
+    let p = 0;
+    const events = [];
+    const primary = { provider: 'google', model: 'g', decide: async () => { p++; if (primaryFail) throw primaryFail; return { actions: [] }; } };
+    const secondary = { provider: 'yandex', model: 'y', decide: async () => { throw Object.assign(new Error('HTTP 500'), { status: 500 }); } };
+    const a = withFallback(primary, secondary, { now: () => t.now, log: { event: (type) => events.push(type) } });
+    await assert.rejects(a.decide({}), /500/);
+    primaryFail = null; // Gemini is back
+    t.now += 1000;
+    await assert.rejects(a.decide({}), /500/); // still in the cooldown: the secondary, failing again
+    t.now += 1000;
+    await a.decide({});
+    assert.equal(p, 2, 'the failing secondary ended the cooldown: the primary is asked again');
+    assert.ok(events.includes('agent.fallback_failed'));
+  });
+
+  test('review 28.09: toolsFor with the host\'s facts — give_word only to who may get the word, ask_done only when it may be asked', () => {
+    const names = (tools) => tools.map((t) => t.function.name);
+    const base = { phase: 'round', present: ['a', 'b', 'c'], speaker: 'a' };
+    const all = toolsFor(base);
+    assert.deepEqual(names(all), ['say', 'give_word', 'ask_done', 'open_floor', 'skip', 'leave']);
+    const narrow = toolsFor({ ...base, can_give: ['c', 'gone'], ask_done: false });
+    assert.deepEqual(names(narrow), ['say', 'give_word', 'open_floor', 'skip', 'leave']);
+    assert.deepEqual(narrow[1].function.parameters.properties.person_id.enum, ['c'], 'only present people, only who may get the word');
+    assert.deepEqual(names(toolsFor({ ...base, can_give: [] })), ['say', 'ask_done', 'open_floor', 'skip', 'leave'], 'everyone spoke: no give_word at all');
   });
 });

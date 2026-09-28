@@ -112,7 +112,9 @@ export async function readToolStream(res, { clock = () => performance.now(), sta
         }
         for (const d of delta.tool_calls ?? []) {
           timings.ttft ??= since();
-          const index = Number.isInteger(d.index) ? d.index : calls.length;
+          // no index: a piece of the open call (no id, no name), else a new call (review 28.09)
+          const last = calls.at(-1);
+          const index = Number.isInteger(d.index) ? d.index : last && !last.closed && !d.id && !d.function?.name ? last.index : calls.length;
           let call = calls.find((c) => c.index === index);
           if (!call) {
             for (const open of calls) if (!open.closed) close(open); // a new index: the previous calls are complete

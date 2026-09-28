@@ -64,4 +64,10 @@ describe('readToolStream', () => {
     assert.deepEqual(calls.map((c) => [c.name, c.args]), [['leave', { text: 'Пока!' }]]);
     assert.deepEqual(toolCallsOfMessage({ content: 'hi' }), []);
   });
+
+  test('review 28.09: argument deltas without an index extend the open call', async () => {
+    const d = (fn, id) => ({ choices: [{ delta: { tool_calls: [{ ...(id ? { id, type: 'function' } : {}), function: fn }] } }] });
+    const r = await readToolStream(sse([d({ name: 'say', arguments: '' }, 'c1'), d({ arguments: '{"text":"Слы' }), d({ arguments: 'шу!"}' }), d({ name: 'skip', arguments: '{}' }, 'c2'), '[DONE]']));
+    assert.deepEqual(r.toolCalls.map((c) => [c.name, c.args]), [['say', { text: 'Слышу!' }], ['skip', {}]]);
+  });
 });

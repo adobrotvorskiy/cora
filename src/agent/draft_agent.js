@@ -37,14 +37,16 @@ export const TOOLS = Object.freeze([
 
 /**
  * The tools of one request: only the ones that make sense in the phase, person ids limited to the people
- * in the room (live 28.09: the model handed the word to absent people 33 times). `plain`: no enums
- * (a server that refuses them).
+ * in the room (live 28.09: the model handed the word to absent people 33 times). With the host's facts
+ * (conductor input): give_word only to those who may get the word (`can_give`: not the speaker, not done),
+ * ask_done only when it may be asked (`ask_done`) — a tool the model cannot misuse instead of a refusal
+ * after the call (review 28.09). `plain`: no enums (a server that refuses them).
  */
 export function toolsFor(input, { plain = false } = {}) {
   const phase = input?.phase ?? null;
   const present = input?.present ?? [];
   const speaker = input?.speaker ?? null;
-  const can = present.filter((id) => id !== speaker);
+  const can = Array.isArray(input?.can_give) ? input.can_give.filter((id) => present.includes(id)) : present.filter((id) => id !== speaker);
   const byName = new Map(TOOLS.map((t) => [t.function.name, t]));
   const pick = (name, person) => {
     const t = structuredClone(byName.get(name));
@@ -53,7 +55,7 @@ export function toolsFor(input, { plain = false } = {}) {
   };
   const out = [pick('say')];
   if (can.length) out.push(pick('give_word', can));
-  if (phase === 'round' && speaker) out.push(pick('ask_done', [speaker]));
+  if (phase === 'round' && speaker && input?.ask_done !== false) out.push(pick('ask_done', [speaker]));
   if (phase === 'round') out.push(pick('open_floor'));
   out.push(pick('skip'), pick('leave'));
   return phase ? out : TOOLS;
@@ -227,11 +229,11 @@ export function createDraftAgent({ endpoint, apiKey, model, system, fetch: fetch
       const { res, started } = await post(input, signal);
       if (/event-stream/i.test(res.headers.get('content-type') ?? '')) {
         const r = await readToolStream(res, { started });
-        return { actions: toActions(r.toolCalls, r.content), timings: r.timings, usage: r.usage };
+        return { actions: toActions(r.toolCalls, r.content), timings: r.timings, usage: r.usage, finish_reason: r.finish_reason ?? null };
       }
       const json = await res.json();
       const msg = json.choices?.[0]?.message ?? {};
-      return { actions: toActions(toolCallsOfMessage(msg), msg.content), timings: { done: Math.round(performance.now() - started) }, usage: json.usage ?? null };
+      return { actions: toActions(toolCallsOfMessage(msg), msg.content), timings: { done: Math.round(performance.now() - started) }, usage: json.usage ?? null, finish_reason: json.choices?.[0]?.finish_reason ?? null };
     },
   };
 }
@@ -258,7 +260,8 @@ export function agentFromSettings({ settings, roster, dayMode = null, env = proc
   if (!fb || fb === primary.provider) return primary;
   let secondary = null;
   try {
-    secondary = oneAgent({ settings: { ...settings, agent: { ...(settings.agent ?? {}), provider: fb, model: undefined, reasoning_effort: undefined, max_tokens: undefined } }, roster, dayMode, env, fetchImpl, assets });
+    // the primary's model, endpoint and thinking settings are not the fallback's (review 28.09: a proxy for Gemini got the Yandex key)
+    secondary = oneAgent({ settings: { ...settings, agent: { ...(settings.agent ?? {}), provider: fb, model: undefined, endpoint: undefined, reasoning_effort: undefined, max_tokens: undefined } }, roster, dayMode, env, fetchImpl, assets });
   } catch (e) {
     log?.event?.('agent.fallback_unavailable', { provider: fb, message: String(e?.message ?? e).slice(0, 200) });
     return primary;
@@ -273,6 +276,7 @@ const COOLDOWN_MS = { 429: 60_000, default: 20_000 };
 /**
  * The primary agent, and the secondary one when it fails (429 / 5xx / timeout / network). After a failure the
  * secondary answers directly for a cooldown (60 s after 429, 20 s otherwise), then the primary is tried again.
+ * The secondary failing during the cooldown ends it: the next decision tries the primary (review 28.09).
  * The result carries fallback: {from, to, reason}.
  */
 export function withFallback(primary, secondary, { log = null, now = () => Date.now() } = {}) {
@@ -287,7 +291,17 @@ export function withFallback(primary, secondary, { log = null, now = () => Date.
       return primary.toolChoice;
     },
     async decide(input, o = {}) {
-      if (now() < coolUntil) return tag(await secondary.decide(input, o), lastReason);
+      if (now() < coolUntil) {
+        try {
+          return tag(await secondary.decide(input, o), lastReason);
+        } catch (e) {
+          if (!o.signal?.aborted) {
+            coolUntil = 0;
+            log?.event?.('agent.fallback_failed', { provider: secondary.provider, message: String(e?.message ?? e).slice(0, 160) });
+          }
+          throw e;
+        }
+      }
       try {
         return await primary.decide(input, o);
       } catch (e) {

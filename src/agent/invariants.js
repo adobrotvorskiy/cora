@@ -6,10 +6,10 @@
 //   situation = {phase, speaker, queue, present}; askedByName: a line she answers named her
 //   («Кора, заканчивай»: she may say goodbye before the round is over — live 28.09)
 
-/** «Тима, продолжай» after an answer (live 27.09, run 2): the host returns the floor itself. */
-export const NO_BRIDGE = /,\s*продолжа/i;
-/** Rules about herself the model made up (live 27.09, run 2). */
-export const INVENTED = /не отвечаю на вопросы|не вмешиваюсь|таковы правила|мне нельзя|мне запрещено/i;
+/** «Тима, продолжай» after an answer (live 27.09, run 2): the host returns the floor itself. The imperative only («Хорошо, продолжаем.» is fine — review 28.09). */
+export const NO_BRIDGE = /,\s*продолжай(те)?(?![\p{L}])/iu;
+/** Rules about herself the model made up (live 27.09, run 2). Not «не вмешиваюсь»: the playbook says so itself (review 28.09). */
+export const INVENTED = /не отвечаю на вопросы|таковы правила|мне нельзя|мне запрещено/i;
 /** The text contract of the old brain: at most ~2 sentences / 220 chars. */
 export const MAX_TEXT_CHARS = 220;
 

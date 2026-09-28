@@ -1211,11 +1211,13 @@ describe('host: agent mode after the review of 27.09', () => {
     assert.equal(h.host.state.current, 'nevsky_g');
     await h.advance(8000, QUIET);
     assert.ok(!h.player.plays.some((p) => p.meta.key === 'check_done'), 'no «Глеб, всё?» to someone silent');
-    assert.ok(h.find('agent.rejected').some((e) => e.reason === 'not_started'));
+    const silences = agent.calls.filter((c) => c.input.speaker === 'nevsky_g').map((c) => c.input.events.find((e) => e.type === 'silence')?.ms);
+    assert.ok(silences.length === 1 && silences[0] >= 6000, `review 28.09: no 1 s / 2.5 s wakes for a speaker who has not started: ${silences}`);
     assert.equal(h.host.state.current, 'belozersky_s');
     assert.equal(h.host.state.get('nevsky_g').status, 'skipped');
     assert.ok(!h.player.plays.slice(-2).some((p) => p.meta.key === 'ack'), 'no «Спасибо» for silence');
-    assert.ok(agent.calls.at(-1).input.queue.includes('nevsky_g'), 'Gleb is back in the queue');
+    const plan = h.host.state.ensurePlan();
+    assert.ok([plan.next, ...plan.then].includes('nevsky_g'), 'Gleb is back in the queue');
     await h.finish();
   });
 

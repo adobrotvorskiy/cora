@@ -27,6 +27,10 @@ function manualAgent() {
           call.answered = true;
           resolve({ actions, ...extra });
         };
+        call.fail = (e = Object.assign(new Error('503 high demand'), { status: 503 })) => {
+          call.answered = true;
+          reject(e);
+        };
         signal?.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
         calls.push(call);
       });
@@ -35,11 +39,12 @@ function manualAgent() {
   };
 }
 
-function makeWorld({ present, phase = 'waiting', speaker = null, queue = [], agent = manualAgent(), budget, dialog, names = {} } = {}) {
+function makeWorld({ present, phase = 'waiting', speaker = null, queue = [], agent = manualAgent(), budget, dialog, names = {}, roster = ROSTER } = {}) {
   const clock = { t: 1_000_000 };
   const now = () => clock.t;
-  const state = createState({ roster: ROSTER, now });
-  const nameOf = (id) => DISPLAY[id] ?? names[id] ?? id; // guests: their Telemost name (guest_1 is the first unknown one)
+  const state = createState({ roster, now });
+  const display = Object.fromEntries(roster.people.map((p) => [p.id, p.display]));
+  const nameOf = (id) => display[id] ?? names[id] ?? id; // guests: their Telemost name (guest_1 is the first unknown one)
   state.applyParticipants(present.map((id) => ({ name: nameOf(id) })), { t: now() });
   if (phase !== 'waiting') {
     state.setPhase(phase);
@@ -100,7 +105,7 @@ function makeWorld({ present, phase = 'waiting', speaker = null, queue = [], age
     alert: (t) => alerts.push(t),
   };
   // the conductor gets io with quiet() as a function; the flags stay on `io`
-  const c = createConductor({ state, agent, io: { ...io, quiet: () => io.quiet }, now, log, leadId: ROSTER.firstAlways, mentionsHost, budget });
+  const c = createConductor({ state, agent, io: { ...io, quiet: () => io.quiet }, now, log, leadId: roster.firstAlways, mentionsHost, budget });
   const w = {
     c,
     state,
@@ -535,12 +540,20 @@ describe('conductor: after the review of 27.09', () => {
   test('ask_done only once the speaker has said something; a silent speaker is handed over as silentPrev, a thanked one as said', async () => {
     const w = makeWorld({ present: ['tkach_t', 'nevsky_g', 'orlov_y'], phase: 'round', speaker: 'nevsky_g', queue: ['orlov_y'] });
     w.her('Дальше Глеб.', { kind: 'handoff' });
-    await w.wait(2600);
-    w.agent.open()[0].answer([{ action: 'ask_done', person: 'nevsky_g' }]);
+    await w.wait(500);
+    w.heard('orlov_y', 'глеб ты тут'); // a colleague's line wakes her; Gleb has not said a word
+    await flush();
+    const first = w.agent.calls[0];
+    assert.equal(first.input.ask_done, false, 'the tool is not offered');
+    assert.ok(!first.input.can_give.includes('nevsky_g'));
+    first.answer([{ action: 'ask_done', person: 'nevsky_g' }]); // a model that calls it anyway (plain tools)
     await flush();
     assert.deepEqual(w.find('agent.rejected').map((e) => e.reason), ['not_started'], '«Глеб, всё?» before Gleb said a word');
-    await w.wait(4000);
-    for (const c of w.agent.open()) c.answer([{ action: 'give_word', person: 'orlov_y', text: '' }]);
+    await w.wait(5000);
+    assert.equal(w.agent.calls.length, 1, 'no 1 s / 2.5 s wakes while the speaker has not started (review 28.09)');
+    await w.wait(1100);
+    assert.equal(w.agent.calls.length, 2, 'the 6 s stage');
+    w.agent.calls[1].answer([{ action: 'give_word', person: 'orlov_y', text: '' }]);
     await flush();
     assert.deepEqual([w.calls.at(-1).tool, w.calls.at(-1).silentPrev, w.calls.at(-1).said], ['giveWord', true, false]);
 
@@ -604,7 +617,7 @@ describe('conductor: after the live test of 28.09', () => {
     assert.ok(inp.names.orlov_y && !/\u0301/.test(inp.names.orlov_y));
   });
 
-  test('the same refused call twice: agent.stuck, no silence wakes until someone speaks', async () => {
+  test('the same refused call twice: agent.stuck — the ladder\'s stages still wake her, its 10 s repeats do not, until someone speaks', async () => {
     const w = makeWorld({ present: ['tkach_t', 'guest_1'], phase: 'round', speaker: 'tkach_t', queue: ['guest_1'], names: { guest_1: 'Зоя' } });
     w.heard('tkach_t', 'у меня всё');
     await flush();
@@ -616,11 +629,15 @@ describe('conductor: after the live test of 28.09', () => {
     await flush();
     assert.equal(w.find('agent.stuck').length, 1);
     const n = w.agent.calls.length;
-    await w.wait(20_000);
-    assert.equal(w.agent.calls.length, n, 'no silence wakes while stuck');
+    for (let i = 0; i < 200; i++) {
+      await w.wait(100);
+      for (const c of w.agent.open()) c.answer([{ action: 'skip' }]);
+    }
+    const late = w.agent.calls.slice(n).map((c) => c.input.events.find((e) => e.type === 'silence')?.ms);
+    assert.deepEqual(late, [1000, 2500, 6000], 'review 28.09: the stages are what makes her hand over a silent speaker; only the repeats wait for speech');
     w.heard('tkach_t', 'Кора дальше давай');
     await flush();
-    assert.equal(w.agent.calls.length, n + 1, 'speech wakes her again');
+    assert.equal(w.agent.calls.length, n + 4, 'speech wakes her again');
   });
 
   test('ask_done «too early» on every line never marks her stuck: the 2.5 s stage still asks (live 28.09, run 2)', async () => {
@@ -751,25 +768,34 @@ describe('conductor: a lit tile holds the wake; a speaker who has not started (2
     const f = makeWorld({ present: ['tkach_t', 'nevsky_g', 'orlov_y'], phase: 'round', speaker: 'nevsky_g', queue: [] });
     f.her('Дальше, Глеб.', { kind: 'handoff' });
     await f.wait(1000);
+    assert.equal(f.agent.calls.length, 0, 'no 1 s wake for a speaker who has not started');
+    f.heard('tkach_t', 'угу'); // someone else's line wakes her
+    await flush();
     f.agent.open()[0].answer([{ action: 'open_floor' }]);
-    await f.wait(100);
+    await flush();
     assert.deepEqual(f.find('agent.rejected').map((e) => [e.tool, e.reason]), [['open_floor', 'speaker_not_started']]);
-    assert.deepEqual(f.agent.calls[1].input.events.at(-1), { type: 'rejected', tool: 'open_floor', reason: 'speaker_not_started', speaker: 'nevsky_g', hint: 'слово у него, он ещё не начал: подожди' });
-    await f.wait(SPEAKER_START_MS - 1100);
-    for (const c of f.agent.open()) c.answer([{ action: 'open_floor' }]);
+    await f.wait(SPEAKER_START_MS);
+    const late = f.agent.open()[0];
+    assert.deepEqual(late.input.events.find((e) => e.type === 'rejected'), { type: 'rejected', tool: 'open_floor', reason: 'speaker_not_started', speaker: 'nevsky_g', hint: 'слово у него, он ещё не начал: подожди' });
+    late.answer([{ action: 'open_floor' }]);
     await flush();
     assert.equal(f.calls.at(-1)?.tool, 'openFloor');
 
     const w = makeWorld({ present: ['tkach_t', 'nevsky_g', 'orlov_y'], phase: 'round', speaker: 'nevsky_g', queue: ['orlov_y'] });
     w.her('Дальше, Глеб.', { kind: 'handoff' });
     await w.wait(1000);
+    w.heard('tkach_t', 'угу');
+    await flush();
     w.agent.open()[0].answer([{ action: 'give_word', person: 'orlov_y' }]);
     await w.wait(100);
+    assert.equal(w.agent.open().length, 0, 'a timing refusal earns no immediate extra wake');
+    w.heard('tkach_t', 'ага ага');
+    await flush();
     w.agent.open()[0].answer([{ action: 'give_word', person: 'orlov_y' }]);
     await flush();
     assert.deepEqual(w.find('agent.rejected').map((e) => [e.tool, e.reason]), [['give_word', 'speaker_not_started'], ['give_word', 'speaker_not_started']]);
-    assert.equal(w.find('agent.stuck').length, 0, 'a timing refusal twice: not stuck, the ladder goes on');
-    await w.wait(SPEAKER_START_MS - 1100);
+    assert.equal(w.find('agent.stuck').length, 0, 'a timing refusal twice: not stuck');
+    await w.wait(SPEAKER_START_MS + 100); // the stage counts from the last speech (the colleague's «ага»)
     w.agent.open()[0].answer([{ action: 'give_word', person: 'orlov_y' }]);
     await flush();
     assert.deepEqual([w.calls.at(-1).tool, w.calls.at(-1).person, w.calls.at(-1).silentPrev], ['giveWord', 'orlov_y', true], 'still silent after 6 s: handed over');
@@ -791,6 +817,196 @@ describe('conductor: a lit tile holds the wake; a speaker who has not started (2
     t.agent.calls[0].answer([{ action: 'open_floor' }]);
     await flush();
     assert.equal(t.calls.at(-1)?.tool, 'openFloor');
+  });
+});
+
+describe('conductor: after the code review of 28.09', () => {
+  test('a timer while the lead\'s tile is lit waits for the tile; so does a wake owed after a decision', async () => {
+    const w = makeWorld({ present: ['orlov_y', 'nevsky_g'] });
+    w.io.litIds = ['orlov_y'];
+    w.heard('orlov_y', 'так коллеги');
+    w.c.timer('start');
+    await w.wait(500);
+    assert.equal(w.agent.calls.length, 0, 'no wake around the hold');
+    w.io.litIds = [];
+    await w.wait(200);
+    assert.equal(w.agent.calls.length, 1);
+    assert.deepEqual(w.agent.calls[0].input.events.map((e) => e.type), ['heard', 'timer']);
+  });
+
+  test('a failed request is tried once more (before the round no ladder would pick it up); twice failed — waits for the next line', async () => {
+    const w = makeWorld({ present: ['orlov_y', 'nevsky_g'] });
+    w.heard('orlov_y', 'кора начинай');
+    await flush();
+    w.agent.calls[0].fail();
+    await w.wait(200);
+    assert.equal(w.agent.calls.length, 2, 'one retry');
+    assert.deepEqual(w.agent.calls[1].input.events.map((e) => e.text), ['кора начинай']);
+    w.agent.calls[1].fail();
+    await w.wait(30_000);
+    assert.equal(w.agent.calls.length, 2, 'no retry loop');
+    assert.deepEqual(w.find('agent.error').map((e) => e.streak), [1, 2]);
+  });
+
+  test('before the round: one wake 6 s after her own line, none after people\'s, no repeats', async () => {
+    const w = makeWorld({ present: ['orlov_y', 'nevsky_g'] });
+    w.heard('orlov_y', 'кора начинай');
+    await flush();
+    w.agent.calls[0].answer([{ action: 'say', text: 'Начинаем?' }]); // a say instead of give_word (live 28.09, 4 times)
+    await flush();
+    w.her('Начинаем?', { kind: 'agent_say' });
+    await w.wait(5900);
+    assert.equal(w.agent.calls.length, 1);
+    await w.wait(200);
+    assert.equal(w.agent.calls.length, 2);
+    assert.deepEqual(w.agent.calls[1].input.events.at(-1), { type: 'silence', ms: 6000, after: 'host' });
+    w.agent.calls[1].answer([{ action: 'skip' }]);
+    await w.wait(40_000);
+    assert.equal(w.agent.calls.length, 2);
+  });
+
+  test('a line nobody was attributed to is not the silent speaker\'s in a group; alone in the room it is', async () => {
+    const w = makeWorld({ present: ['tkach_t', 'nevsky_g', 'orlov_y'], phase: 'round', speaker: 'nevsky_g', queue: [] });
+    w.her('Дальше, Глеб.', { kind: 'handoff' });
+    w.heard('?', 'слушай а ты созвон перенёс');
+    await flush();
+    assert.equal(w.agent.calls[0].input.ask_done, false);
+    w.agent.calls[0].answer([{ action: 'ask_done', person: 'nevsky_g' }]);
+    await flush();
+    assert.deepEqual(w.find('agent.rejected').map((e) => e.reason), ['not_started']);
+
+    const one = makeWorld({ present: ['nevsky_g'], phase: 'round', speaker: 'nevsky_g', queue: [] });
+    one.heard('?', 'сегодня делаю ревью');
+    await one.wait(2600);
+    assert.equal(one.agent.calls.at(-1).input.ask_done !== false || one.agent.calls.length === 1, true);
+    for (const c of one.agent.open()) c.answer([{ action: 'skip' }]);
+    await one.wait(100);
+    assert.equal(one.c.input().ask_done, true, 'alone in the room: the line is his');
+  });
+
+  test('a skip ends a refusal streak: the same refusal after it is not «stuck» and earns the extra wake again', async () => {
+    const w = makeWorld({ present: ['tkach_t', 'nevsky_g', 'orlov_y'], phase: 'round', speaker: 'tkach_t', queue: ['nevsky_g'] });
+    w.heard('tkach_t', 'начну с ревью');
+    await flush();
+    w.agent.calls[0].answer([{ action: 'give_word', person: 'orlov_y', text: '' }]); // spoke already
+    await w.wait(100);
+    assert.equal(w.agent.open().length, 1, 'the extra wake after a refused turn tool');
+    w.agent.open()[0].answer([{ action: 'skip' }]);
+    await w.wait(1000); // the 1 s stage, no speech in between
+    w.agent.open()[0].answer([{ action: 'give_word', person: 'orlov_y', text: '' }]);
+    await w.wait(100);
+    assert.equal(w.find('agent.stuck').length, 0, 'a skip between: not stuck');
+    assert.equal(w.agent.open().length, 1, 'the extra wake again');
+  });
+
+  test('names with stress marks from people.json: «Ти́ма» is Тима in a handoff text', async () => {
+    const roster = { ...ROSTER, people: ROSTER.people.map((p) => (p.id === 'tkach_t' ? { ...p, vocative: 'Ти́ма' } : p)) };
+    const w = makeWorld({ roster, present: ['tkach_t', 'nevsky_g', 'orlov_y'], phase: 'round', speaker: 'nevsky_g', queue: ['orlov_y'] });
+    w.heard('nevsky_g', 'у меня всё');
+    await flush();
+    w.agent.calls[0].answer([{ action: 'give_word', person: 'orlov_y', text: 'Спасибо! Тима, потом ты.' }]);
+    await flush();
+    assert.deepEqual(w.find('agent.rejected').map((e) => e.reason), ['text_names_someone_else']);
+  });
+
+  test('«Принято, Глеб. Кто-то ещё?» then the same to Тимур is not a repeat; the same line to the same person is', async () => {
+    const w = makeWorld({ present: ['tkach_t', 'nevsky_g', 'orlov_y'], phase: 'open_floor' });
+    w.heard('nevsky_g', 'у меня вопрос по релизу решили');
+    await flush();
+    w.agent.calls[0].answer([{ action: 'say', text: 'Принято, Глеб. Кто-то ещё?' }]);
+    await flush();
+    w.her('Принято, Глеб. Кто-то ещё?', { kind: 'agent_say' });
+    await w.wait(9000);
+    for (const c of w.agent.open()) c.answer([{ action: 'skip' }]);
+    w.heard('tkach_t', 'и я добавлю тесты зелёные');
+    await flush();
+    w.agent.open()[0].answer([{ action: 'say', text: 'Принято, Тимур. Кто-то ещё?' }]);
+    await flush();
+    assert.deepEqual(w.calls.filter((c) => c.tool === 'say').map((c) => c.text), ['Принято, Глеб. Кто-то ещё?', 'Принято, Тимур. Кто-то ещё?']);
+    w.her('Принято, Тимур. Кто-то ещё?', { kind: 'agent_say' });
+    await w.wait(9000);
+    for (const c of w.agent.open()) c.answer([{ action: 'skip' }]);
+    w.heard('tkach_t', 'и ещё одно');
+    await flush();
+    w.agent.open()[0].answer([{ action: 'say', text: 'Принято, Тимур. Кто-то ещё?' }]);
+    await flush();
+    assert.deepEqual(w.find('agent.rejected').map((e) => e.reason), ['repeat']);
+  });
+
+  test('a handoff text: ordinary words and absent people are not «someone else»; a present colleague is', async () => {
+    const w = makeWorld({ present: ['tkach_t', 'nevsky_g', 'guest_1'], phase: 'round', speaker: 'nevsky_g', queue: ['tkach_t'], names: { guest_1: 'Слава' } });
+    w.heard('nevsky_g', 'у меня всё');
+    await flush();
+    w.agent.calls[0].answer([{ action: 'give_word', person: 'tkach_t', text: 'Славно! Тимур, твоя очередь, а Олег потом.' }]);
+    await flush();
+    assert.equal(w.find('agent.rejected').length, 0, '«Славно» is not Слава; Олег is not in the room');
+    assert.equal(w.calls.at(-1).tool, 'giveWord');
+
+    const t = makeWorld({ present: ['tkach_t', 'nevsky_g', 'guest_1'], phase: 'round', speaker: 'nevsky_g', queue: ['tkach_t'], names: { guest_1: 'Слава' } });
+    t.heard('nevsky_g', 'у меня всё');
+    await flush();
+    t.agent.calls[0].answer([{ action: 'give_word', person: 'tkach_t', text: 'Спасибо! Дальше Славе.' }]);
+    await flush();
+    assert.deepEqual(t.find('agent.rejected').map((e) => e.reason), ['text_names_someone_else']);
+  });
+
+  test('not_addressed: not before the round, not for a say next to a handoff', async () => {
+    const w = makeWorld({ present: ['tkach_t', 'nevsky_g', 'orlov_y'] });
+    w.heard('tkach_t', 'а кого мы ждём');
+    await flush();
+    w.agent.calls[0].answer([{ action: 'say', text: 'Все на месте, можно начинать.' }]);
+    await flush();
+    assert.equal(w.calls.at(-1)?.tool, 'say', 'the playbook: before the start she answers about the meeting');
+
+    const r = makeWorld({ present: ['tkach_t', 'nevsky_g', 'orlov_y'], phase: 'round', speaker: 'nevsky_g', queue: ['tkach_t'] });
+    r.her('Дальше, Глеб.', { kind: 'handoff' });
+    await r.wait(6100);
+    r.agent.open()[0].answer([{ action: 'say', text: 'Глеба не слышно, вернусь к нему в конце.' }, { action: 'give_word', person: 'tkach_t' }]);
+    await flush();
+    assert.deepEqual(r.calls.map((c) => c.tool), ['say', 'giveWord'], 'the prompt tells her to do exactly this');
+  });
+
+  test('the lead asked to start with a colleague a decision ago: the lead-first rule still gives way', async () => {
+    const w = makeWorld({ present: ['orlov_y', 'nevsky_g', 'tkach_t'] });
+    w.heard('orlov_y', 'кора начни сегодня с глеба');
+    await flush();
+    w.agent.calls[0].answer([{ action: 'say', text: 'Хорошо.' }]);
+    await w.wait(5000);
+    w.heard('tkach_t', 'кора начинай');
+    await flush();
+    w.agent.open()[0].answer([{ action: 'give_word', person: 'nevsky_g', text: 'Доброе утро! Глеб, начнёшь?' }]);
+    await flush();
+    assert.equal(w.find('agent.rejected').length, 0);
+    assert.equal(w.calls.at(-1).tool, 'startRound');
+  });
+
+  test('leave before the round is over needs her name in the lines of this decision, not 15 s ago', async () => {
+    const w = makeWorld({ present: ['tkach_t', 'nevsky_g'], phase: 'round', speaker: 'tkach_t', queue: ['nevsky_g'] });
+    w.heard('tkach_t', 'кора подожди секунду');
+    await flush();
+    w.agent.calls[0].answer([{ action: 'skip' }]);
+    await w.wait(15_000);
+    for (const c of w.agent.open()) c.answer([{ action: 'skip' }]);
+    w.heard('tkach_t', 'ну всё пока');
+    await flush();
+    w.agent.open()[0].answer([{ action: 'leave', text: 'Всем пока!' }]);
+    await flush();
+    assert.deepEqual(w.find('agent.rejected').map((e) => e.reason), ['round_not_finished']);
+  });
+
+  test('close(): no wakes while she leaves; a cut «всё?» is not an asked one', async () => {
+    const w = makeWorld({ present: ['tkach_t', 'nevsky_g'], phase: 'round', speaker: 'tkach_t', queue: ['nevsky_g'] });
+    w.heard('tkach_t', 'сегодня тесты');
+    await flush();
+    w.agent.calls[0].answer([{ action: 'skip' }]);
+    w.her('Тимур, всё?', { kind: 'check_done', cut: true });
+    await w.wait(1100);
+    assert.deepEqual(w.agent.calls[1].input.events.at(-1), { type: 'silence', ms: 1000, after: 'host' });
+    w.agent.calls[1].answer([{ action: 'skip' }]);
+    w.c.close();
+    w.heard('tkach_t', 'и ещё одно');
+    await w.wait(10_000);
+    assert.equal(w.agent.calls.length, 2);
   });
 });
 
