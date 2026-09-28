@@ -168,8 +168,9 @@ export function toActions(toolCalls, content = '') {
  * @param {boolean} [o.stream]
  * @param {number} [o.temperature]
  * @param {string|null} [o.reasoningEffort]  reasoning_effort for models that think (Gemini): less thinking, faster answers
+ * @param {number} [o.maxTokens]  output cap; a thinking model spends part of it on thoughts (Gemini: 2048)
  */
-export function createDraftAgent({ endpoint, apiKey, model, system, fetch: fetchImpl = globalThis.fetch, timeoutMs = 15_000, stream = true, temperature = 0.2, reasoningEffort = null }) {
+export function createDraftAgent({ endpoint, apiKey, model, system, fetch: fetchImpl = globalThis.fetch, timeoutMs = 15_000, stream = true, temperature = 0.2, reasoningEffort = null, maxTokens = 400 }) {
   let toolChoice = 'required';
   let plainTools = false; // the server refused enum in the tool schema: plain ids from then on
   let effort = reasoningEffort; // dropped for good if the server refuses it
@@ -185,7 +186,7 @@ export function createDraftAgent({ endpoint, apiKey, model, system, fetch: fetch
           tools: toolsFor(input, { plain: plainTools }),
           tool_choice: toolChoice,
           temperature,
-          max_tokens: 400,
+          max_tokens: maxTokens,
           ...(effort ? { reasoning_effort: effort } : {}),
           ...(stream ? { stream: true } : {}),
         }),
@@ -261,6 +262,7 @@ export function agentFromSettings({ settings, roster, dayMode = null, env = proc
     timeoutMs: settings.agent?.timeout_ms ?? 8000,
     temperature: settings.agent?.temperature ?? 0.2,
     reasoningEffort: settings.agent?.reasoning_effort ?? (provider === 'google' ? 'low' : null),
+    maxTokens: settings.agent?.max_tokens ?? (provider === 'google' ? 2048 : 400), // Gemini counts its thoughts in the cap
     ...(fetchImpl ? { fetch: fetchImpl } : {}),
   });
   return Object.assign(agent, { model: sel.model, provider, prompt: system });

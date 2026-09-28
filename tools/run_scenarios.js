@@ -79,6 +79,7 @@ async function main() {
     system,
     timeoutMs: Number(values.timeout),
     reasoningEffort: values.effort ?? (provider === 'google' ? 'low' : null),
+    maxTokens: provider === 'google' ? 2048 : 400,
   });
   const only = values.only?.split(',').map((s) => s.trim()).filter(Boolean) ?? null;
   console.log(`${provider} ${model}; prompt ${values.prompt}; ${only?.length ?? SCENARIOS.length} scenarios x ${values.rounds} round(s)\n`);

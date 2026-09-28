@@ -110,7 +110,7 @@ describe('skills: the playbook by phase', () => {
     const seen = [];
     const fetch = async (url, init) => {
       const body = JSON.parse(init.body);
-      seen.push({ url, auth: init.headers.Authorization, model: body.model, effort: body.reasoning_effort ?? null, system: body.messages[0].content });
+      seen.push({ url, auth: init.headers.Authorization, model: body.model, effort: body.reasoning_effort ?? null, max: body.max_tokens, system: body.messages[0].content });
       if (body.reasoning_effort) return new Response('{"error":{"message":"reasoning_effort is not supported for this model"}}', { status: 400 });
       return new Response(JSON.stringify({ choices: [{ message: { tool_calls: [{ id: 'a', type: 'function', function: { name: 'skip', arguments: '{}' } }] } }] }), { headers: { 'content-type': 'application/json' } });
     };
@@ -124,6 +124,7 @@ describe('skills: the playbook by phase', () => {
     assert.equal(seen[0].auth, 'Bearer k-g');
     assert.equal(seen[0].model, 'gemini-test-flash');
     assert.deepEqual(seen.map((x) => x.effort), ['low', null, null], 'refused once, never sent again');
+    assert.equal(seen[0].max, 2048, 'room for the thoughts before the tool call');
     assert.match(seen[1].system, /Gemini Test Flash от Google/);
   });
 });
