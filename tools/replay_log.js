@@ -80,6 +80,7 @@ async function main() {
         if (acts.length) console.log(`${clockOf(e.at)}   -> ${acts.map((a) => `${a.action}${a.person ? `(${a.person})` : ''}${a.text ? ` «${a.text}»` : ''}`).join(' + ')}`);
       } else if (e.type === 'agent.rejected') console.log(`${clockOf(e.at)}   !! rejected ${e.tool}: ${e.reason}`);
       else if (e.type === 'agent.aborted') console.log(`${clockOf(e.at)}   .. aborted by a newer line`);
+      else if (e.type === 'agent.held') console.log(`${clockOf(e.at)}   .. held ${e.ms} ms while ${e.who}'s tile was lit (${e.why})`);
     },
   });
   console.log(`\n${JSON.stringify(r.summary, null, 2)}`);

@@ -229,6 +229,10 @@ function makeHost({ present = [], brainScript = null, brainHang = false, flags =
       tiles = names.map(tile);
       observerCb?.({ type: 'participants', list: tiles });
     },
+    /** Telemost's active-speaker marker: the tiles lit now */
+    lit(names) {
+      observerCb?.({ type: 'speaker', names });
+    },
     types: (re) => events.filter((e) => re.test(e.type)).map((e) => e.type),
     find: (type) => events.filter((e) => e.type === type),
     async ready() {
@@ -1108,6 +1112,29 @@ describe('host: agent mode (voice.host = "agent")', () => {
     assert.equal(mute.player.plays.length, 0);
     assert.equal(mute.find('agent.disabled')[0].reason, '--no-brain');
     await mute.finish();
+  });
+});
+
+describe('host: agent mode, a lit tile (28.09)', () => {
+  test('a final while its author\'s tile is lit: the agent is woken when the tile goes dark, with every piece', async () => {
+    const agent = scriptAgent((input) => (input.events.some((e) => e.type === 'heard' && /привет/.test(e.text)) ? [{ action: 'say', text: 'Привет, Тима!' }] : [{ action: 'skip' }]));
+    const h = makeHost({ present: ['Тимур Ткач', 'Глеб Невский'], onDemand: true, agent });
+    await h.ready();
+    h.lit(['Тимур Ткач']);
+    await h.advance(1200, QUIET);
+    final(h, 'a1', 'Кора, привет');
+    await h.advance(600, QUIET);
+    final(h, 'a2', 'как у тебя дела');
+    await h.advance(600, QUIET);
+    assert.equal(agent.calls.length, 0, 'the tile is lit: the person goes on');
+    assert.deepEqual(h.find('agent.hold').map((e) => e.who), ['tkach_t']);
+    h.lit([]);
+    await h.advance(1000, QUIET);
+    assert.equal(agent.calls.length, 1);
+    assert.deepEqual(agent.calls[0].input.events.filter((e) => e.type === 'heard').map((e) => e.text), ['Кора, привет', 'как у тебя дела']);
+    assert.deepEqual(h.player.plays.map((p) => p.meta.text), ['Привет, Тима!']);
+    assert.equal(h.find('agent.held')[0].why, 'dark');
+    await h.finish();
   });
 });
 

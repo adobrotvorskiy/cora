@@ -112,6 +112,20 @@ describe('replay: through the conductor', () => {
     const lastWake = r.events.filter((e) => e.type === 'agent.wake').at(-1);
     assert.ok(lastWake.at < 41_000, 'no wakes after everyone left');
   });
+
+  test('page.speaker in the log: two pieces while the tile is lit give one wake, after the tile went dark', async () => {
+    const lit = LOG.split('\n');
+    lit.splice(lit.findIndex((l) => l.includes('сегодня делаю интеграцию')), 0, rec(16.5, 'page.speaker', { names: ['x'], ids: ['tkach_t'] }));
+    lit.splice(lit.findIndex((l) => l.includes('у меня всё')), 0, rec(19, 'page.speaker', { names: [], ids: [] }));
+    const tl = timelineOf(parseLog(lit.join('\n')));
+    assert.deepEqual(tl.events.filter((e) => e.type === 'lit').map((e) => [e.at, e.ids]), [[16_500, ['tkach_t']], [19_000, []]]);
+    const r = await replayTimeline(tl, { agent: scripted(), roster: ROSTER, mode: 'forced', tailMs: 3000 });
+    assert.equal(r.summary.held, 1);
+    assert.equal(r.summary.aborted, 0, 'no request for the first piece to abort');
+    const wake = r.events.find((e) => e.type === 'agent.wake' && e.events.some((x) => x.text === 'потом ревью'));
+    assert.ok(wake.at >= 19_000);
+    assert.deepEqual(wake.events.filter((x) => x.type === 'heard').map((x) => x.text), ['сегодня делаю интеграцию', 'потом ревью']);
+  });
 });
 
 describe('replay: a scenario draft from a log', () => {

@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { describe, test } from 'node:test';
-import { ASK_DONE_MIN_SILENCE_MS, MAX_PREEMPTS, SILENCE_REPEAT_MS, createConductor } from '../../src/agent/conductor.js';
+import { ASK_DONE_MIN_SILENCE_MS, LIT_HOLD_MAX_MS, LIT_HOLD_MS, MAX_PREEMPTS, SILENCE_REPEAT_MS, SPEAKER_START_MS, createConductor } from '../../src/agent/conductor.js';
 import { SCENARIOS } from '../../src/agent/scenarios.js';
 import { createState, loadRoster } from '../../src/core/state.js';
 
@@ -55,6 +55,7 @@ function makeWorld({ present, phase = 'waiting', speaker = null, queue = [], age
     room: false,
     busy: false,
     quiet: false,
+    litIds: [], // Telemost tiles lit now
     queued: [], // {kind, epoch, dropped}
     say(o) {
       calls.push({ tool: 'say', ...o });
@@ -93,6 +94,7 @@ function makeWorld({ present, phase = 'waiting', speaker = null, queue = [], age
       return n;
     },
     roomSpeaking: () => io.room,
+    lit: () => io.litIds,
     hostBusy: () => io.busy,
     canSpeak: () => !io.room,
     alert: (t) => alerts.push(t),
@@ -682,6 +684,115 @@ describe('conductor: after the live test of 28.09', () => {
 });
 
 // --------------------------------------------------------------------------- scenarios, host path
+
+describe('conductor: a lit tile holds the wake; a speaker who has not started (28.09)', () => {
+  test('a final while its author is lit: no wake until the tile goes dark, then one wake with every piece', async () => {
+    const w = makeWorld({ present: ['tkach_t', 'nevsky_g'], phase: 'round', speaker: 'tkach_t', queue: ['nevsky_g'] });
+    w.io.litIds = ['tkach_t'];
+    w.heard('tkach_t', 'сегодня доделываю интеграцию');
+    await w.wait(600);
+    w.heard('tkach_t', 'и потом ревью у Глеба');
+    await w.wait(600);
+    assert.equal(w.agent.calls.length, 0, 'mid-thought: SpeechKit closed the phrase on a pause, the tile is still lit');
+    w.io.litIds = [];
+    await w.wait(100);
+    assert.equal(w.agent.calls.length, 1);
+    assert.deepEqual(w.agent.calls[0].input.events.map((e) => e.text), ['сегодня доделываю интеграцию', 'и потом ревью у Глеба']);
+    assert.deepEqual(w.find('agent.hold').map((e) => e.who), ['tkach_t']);
+    assert.deepEqual(w.find('agent.held').map((e) => [e.who, e.why]), [['tkach_t', 'dark']]);
+    assert.ok(w.find('agent.held')[0].ms >= 1200);
+  });
+
+  test(`a tile that stays lit: the wake goes after ${LIT_HOLD_MS} ms; a piece being recognized keeps it, up to ${LIT_HOLD_MAX_MS} ms`, async () => {
+    const w = makeWorld({ present: ['tkach_t', 'nevsky_g'], phase: 'round', speaker: 'tkach_t', queue: ['nevsky_g'] });
+    w.io.litIds = ['tkach_t'];
+    w.heard('tkach_t', 'сегодня тесты');
+    await w.wait(LIT_HOLD_MS - 200);
+    assert.equal(w.agent.calls.length, 0);
+    await w.wait(300);
+    assert.equal(w.agent.calls.length, 1);
+    assert.equal(w.find('agent.held')[0].why, 'timeout');
+
+    const t = makeWorld({ present: ['tkach_t', 'nevsky_g'], phase: 'round', speaker: 'tkach_t', queue: ['nevsky_g'] });
+    t.io.litIds = ['tkach_t'];
+    t.heard('tkach_t', 'сегодня тесты');
+    t.io.room = true; // the next piece: a partial, no final yet
+    await t.wait(LIT_HOLD_MAX_MS - 200);
+    assert.equal(t.agent.calls.length, 0);
+    await t.wait(300);
+    assert.equal(t.agent.calls.length, 1);
+    assert.equal(t.find('agent.held')[0].why, 'max');
+  });
+
+  test('no silence wake during a hold; someone else\'s final wakes at once, with the held line', async () => {
+    const w = makeWorld({ present: ['tkach_t', 'nevsky_g', 'orlov_y'], phase: 'round', speaker: 'tkach_t', queue: ['nevsky_g'] });
+    w.io.litIds = ['tkach_t'];
+    w.heard('tkach_t', 'сегодня тесты');
+    await w.wait(1400);
+    assert.equal(w.agent.calls.length, 0, 'the 1 s stage of the ladder waits too');
+    w.heard('nevsky_g', 'кора а ты что думаешь');
+    await flush();
+    assert.equal(w.agent.calls.length, 1);
+    assert.deepEqual(w.agent.calls[0].input.events.map((e) => e.who), ['tkach_t', 'nevsky_g']);
+    assert.equal(w.find('agent.held')[0].why, 'other');
+  });
+
+  test('no tile info: the final wakes at once, as before', async () => {
+    const w = makeWorld({ present: ['tkach_t', 'nevsky_g'], phase: 'round', speaker: 'tkach_t', queue: ['nevsky_g'] });
+    w.io.litIds = ['nevsky_g'];
+    w.heard('tkach_t', 'сегодня тесты');
+    await flush();
+    assert.equal(w.agent.calls.length, 1, 'only the author\'s own tile holds');
+    assert.equal(w.find('agent.hold').length, 0);
+  });
+
+  test(`open_floor / give_word to another: not while the speaker has not started, ${SPEAKER_START_MS} ms after her handoff at most`, async () => {
+    // live 28.09: «Все высказались…» 1.7 s after «Дальше, …», the guest had not started yet
+    const f = makeWorld({ present: ['tkach_t', 'nevsky_g', 'orlov_y'], phase: 'round', speaker: 'nevsky_g', queue: [] });
+    f.her('Дальше, Глеб.', { kind: 'handoff' });
+    await f.wait(1000);
+    f.agent.open()[0].answer([{ action: 'open_floor' }]);
+    await f.wait(100);
+    assert.deepEqual(f.find('agent.rejected').map((e) => [e.tool, e.reason]), [['open_floor', 'speaker_not_started']]);
+    assert.deepEqual(f.agent.calls[1].input.events.at(-1), { type: 'rejected', tool: 'open_floor', reason: 'speaker_not_started', speaker: 'nevsky_g', hint: 'слово у него, он ещё не начал: подожди' });
+    await f.wait(SPEAKER_START_MS - 1100);
+    for (const c of f.agent.open()) c.answer([{ action: 'open_floor' }]);
+    await flush();
+    assert.equal(f.calls.at(-1)?.tool, 'openFloor');
+
+    const w = makeWorld({ present: ['tkach_t', 'nevsky_g', 'orlov_y'], phase: 'round', speaker: 'nevsky_g', queue: ['orlov_y'] });
+    w.her('Дальше, Глеб.', { kind: 'handoff' });
+    await w.wait(1000);
+    w.agent.open()[0].answer([{ action: 'give_word', person: 'orlov_y' }]);
+    await w.wait(100);
+    w.agent.open()[0].answer([{ action: 'give_word', person: 'orlov_y' }]);
+    await flush();
+    assert.deepEqual(w.find('agent.rejected').map((e) => [e.tool, e.reason]), [['give_word', 'speaker_not_started'], ['give_word', 'speaker_not_started']]);
+    assert.equal(w.find('agent.stuck').length, 0, 'a timing refusal twice: not stuck, the ladder goes on');
+    await w.wait(SPEAKER_START_MS - 1100);
+    w.agent.open()[0].answer([{ action: 'give_word', person: 'orlov_y' }]);
+    await flush();
+    assert.deepEqual([w.calls.at(-1).tool, w.calls.at(-1).person, w.calls.at(-1).silentPrev], ['giveWord', 'orlov_y', true], 'still silent after 6 s: handed over');
+  });
+
+  test('the speaker has spoken, or the room asks her by name: open_floor at once', async () => {
+    const w = makeWorld({ present: ['tkach_t', 'nevsky_g', 'orlov_y'], phase: 'round', speaker: 'nevsky_g', queue: [] });
+    w.her('Дальше, Глеб.', { kind: 'handoff' });
+    w.heard('nevsky_g', 'я сегодня тесты у меня всё');
+    await flush();
+    w.agent.calls[0].answer([{ action: 'open_floor' }]);
+    await flush();
+    assert.equal(w.calls.at(-1)?.tool, 'openFloor');
+
+    const t = makeWorld({ present: ['tkach_t', 'nevsky_g', 'orlov_y'], phase: 'round', speaker: 'nevsky_g', queue: [] });
+    t.her('Дальше, Глеб.', { kind: 'handoff' });
+    t.heard('orlov_y', 'кора давай вопросы глеба нет');
+    await flush();
+    t.agent.calls[0].answer([{ action: 'open_floor' }]);
+    await flush();
+    assert.equal(t.calls.at(-1)?.tool, 'openFloor');
+  });
+});
 
 const isAskDone = (text) => /всё\?\s*$/i.test(text);
 

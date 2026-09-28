@@ -76,6 +76,9 @@ export function timelineOf(records) {
       case 'speech.shadow':
         if (r.text) events.push({ at, type: 'her', text: r.text, cut: false, kind: r.kind ?? null });
         break;
+      case 'page.speaker':
+        events.push({ at, type: 'lit', ids: Array.isArray(r.ids) ? r.ids : [] }); // the agent holds a wake while the author's tile is lit
+        break;
       case 'turn.start':
         events.push({ at, type: 'turn', who: r.who });
         break;
@@ -208,6 +211,7 @@ export async function replayTimeline(tl, { agent, roster, mode = 'forced', laten
           openFloor: (o) => record('openFloor', o),
           leave: (o) => record('leave', o),
         };
+  let litIds = []; // tiles lit now (page.speaker)
   const c = createConductor({
     state,
     agent: wrapped,
@@ -215,6 +219,7 @@ export async function replayTimeline(tl, { agent, roster, mode = 'forced', laten
       ...io,
       drop: () => 0,
       roomSpeaking: () => spans.some(([a, b]) => clock.t >= a && clock.t < b),
+      lit: () => litIds,
       hostBusy: () => clock.t < her.busyUntil,
       canSpeak: () => !spans.some(([a, b]) => clock.t >= a && clock.t < b),
       quiet: () => false,
@@ -247,6 +252,9 @@ export async function replayTimeline(tl, { agent, roster, mode = 'forced', laten
           break;
         case 'heard':
           c.heard({ who: state.get(e.who) ? e.who : (state.idForName(names.get(e.who) ?? '') ?? '?'), text: e.text, t: clock.t });
+          break;
+        case 'lit':
+          litIds = e.ids;
           break;
         case 'her_start':
           if (mode === 'forced') her.busyUntil = Infinity;
@@ -328,6 +336,7 @@ function summarize(events, her, stats) {
       rejected: count(of('agent.rejected'), 'reason'),
       dropped: stats.dropped,
       aborted: stats.aborted,
+      held: of('agent.held').length,
       text_only: stats.text_only,
       says: says.length,
       says_unaddressed: says.filter((c) => !c.how).length,

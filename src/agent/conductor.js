@@ -7,7 +7,7 @@
 //   c.heard({who, text, t})          a final line (after stt_fixes, her echo filtered, speaker attributed)
 //   c.herLine({text, cut, kind, t})  her line ended (completed, or cut by a barge-in)
 //   c.interrupted({text}) · c.chorus({who}) · c.joined(id) · c.left(id) · c.timer(name)
-//   c.tick(t)                        every host tick: the silence ladder, re-wakes
+//   c.tick(t)                        every host tick: the silence ladder, re-wakes, the end of a held wake
 //
 // Wake -> agent.decide(input, {signal}) -> tool calls -> executor: invariants (src/agent/invariants.js
 // and the host's own checks below); a refused call is logged (agent.rejected) and the agent hears
@@ -21,7 +21,8 @@
 // said, silentPrev}) · askDone({person, epoch}) · openFloor({epoch, said, silentPrev}) · leave({text, epoch})
 // -> {ok, reason?} (said: she has just said something in this decision — no ack clip on top; silentPrev: the
 // speaker never spoke in the turn — no ack, marked skipped); drop(epoch) -> n
-// (her lines still waiting with an older epoch); roomSpeaking() · hostBusy() · canSpeak() · quiet(); alert(text).
+// (her lines still waiting with an older epoch); roomSpeaking() · hostBusy() · canSpeak() · quiet(); alert(text);
+// lit() -> ids whose Telemost tile is lit now (a final while its author's tile is lit holds the wake: LIT_HOLD_MS).
 // `how` (src/core/addressing.js mayAnswer): was one of the lines she answers addressed to her ('name' = by name).
 
 import { mayAnswer } from '../core/addressing.js';
@@ -33,6 +34,22 @@ export const SILENCE_LADDER = Object.freeze({ round: Object.freeze([1000, 2500, 
 export const SILENCE_REPEAT_MS = 10_000;
 export const SILENCE_REPEATS = 3;
 export const ASK_DONE_MIN_SILENCE_MS = 2500;
+/**
+ * A final while its author's tile is still lit: the person may be mid-thought. Telemost's marker hangs ~0.7 s
+ * after the voice; SpeechKit closes a phrase on a ~0.5 s pause (28.09, 4 runs, 86 finals: 20 were followed by
+ * more of the same person within 1.5 s, one sentence came in five finals). The wake waits until the tile goes
+ * dark, at most LIT_HOLD_MS; while the next piece is being recognized (roomSpeaking) it keeps waiting — the
+ * piece's final holds again — up to LIT_HOLD_MAX_MS from the first held final. On those logs: 12 of the 20
+ * pieces merge, a finished phrase waits +0.13 s (p50; p90 0.43 s, 1.5 s at most).
+ */
+export const LIT_HOLD_MS = 1500;
+export const LIT_HOLD_MAX_MS = 8000;
+/**
+ * The speaker has not said a word since she gave it: no give_word to another and no open_floor until this
+ * much has passed since her line (live 28.09: open_floor 1.7 s after «Дальше, X.», the guest had not
+ * started yet — «ты мне не дала сказать»). Asked by the room (a line addressed to her) — no wait.
+ */
+export const SPEAKER_START_MS = 6000;
 /** A `say` nobody asked for (no line addressed to her among the ones it answers): at most one per this. */
 export const UNSOLICITED_EVERY_MS = 20_000;
 /** On the open floor additions are answers to her question («Принято, Глеб. Кто-то ещё?»): a shorter limit. */
@@ -45,7 +62,7 @@ export const DEFAULT_BUDGET = Object.freeze({ max_calls: 800, max_tokens: 4_000_
 const DIALOG_KEEP = 40;
 const TURN_TOOLS = new Set(['give_word', 'ask_done', 'open_floor', 'leave']);
 /** «Not yet» refusals: the same call is right a bit later, so repeating it never marks the agent stuck (live 28.09, run 2). */
-const TIMING = new Set(['too_early', 'too_often', 'start_pending', 'turn_change_in_progress', 'closing']);
+const TIMING = new Set(['too_early', 'too_often', 'start_pending', 'turn_change_in_progress', 'closing', 'speaker_not_started']);
 const ACTIVE = { waiting: 'waiting', starting: 'waiting', round: 'round', open_floor: 'open_floor' };
 /** «повтори», «не расслышал»: saying her line again is what they asked for. */
 const REPEAT_ASK_RE = /повтор|ещё раз|еще раз|не расслыш|не услыш|не понял/iu;
@@ -95,6 +112,8 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
   let lastBusyAt = -Infinity;
   let askedDoneFor = null;
   let spokeIn = null; // the speaker who has said something since getting the word (ask_done needs it)
+  let wordGivenAt = -Infinity; // end of her line that gave the word (start / handoff)
+  let hold = null; // {who, since, until}: a wake held while the author's tile is lit (LIT_HOLD_MS)
   let lastAddressed = null; // {how, t}: the last line addressed to her, until she answers
   let lastUnsolicitedAt = -Infinity;
   const ladder = { from: null, fired: 0, repeats: 0 };
@@ -180,7 +199,27 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
     stuck = false;
     if (letters(s) < 2) return; // «а», «м»: in the dialog, not worth a wake
     bump('heard');
+    if (who !== '?' && lit().includes(who)) {
+      if (!hold) ev('agent.hold', { who });
+      hold = { who, since: hold?.since ?? t, until: t + LIT_HOLD_MS };
+      return;
+    }
+    if (hold) release(who === hold.who ? 'dark' : 'other', t); // the wake covers the held lines too
     wake('heard');
+  }
+
+  function lit() {
+    try {
+      const ids = io.lit?.();
+      return Array.isArray(ids) ? ids : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function release(why, t) {
+    ev('agent.held', { who: hold.who, ms: Math.round(t - hold.since), why });
+    hold = null;
   }
 
   function herLine({ text, cut = false, kind = null, t = now() }) {
@@ -191,6 +230,7 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
     lastHerEndAt = Math.max(lastHerEndAt, t);
     lastHerKind = kind;
     if (kind === 'check_done' && !cut) askedDoneFor = state.current;
+    if ((kind === 'start' || kind === 'handoff') && !cut) wordGivenAt = t;
     if (!cut && (kind === 'agent_say' || kind === 'start' || kind === 'handoff') && lastAddressed && lastAddressed.t <= t) lastAddressed = null; // answered
     resetLadder(t);
   }
@@ -232,6 +272,14 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
 
   function tick(t = now()) {
     if (!agent || stats.disabled || !phase()) return;
+    if (hold) {
+      // no wake of any kind while the author's tile is lit: the line may go on
+      const talking = Boolean(io.roomSpeaking?.());
+      const dark = !lit().includes(hold.who);
+      if (t - hold.since < LIT_HOLD_MAX_MS && (talking || (!dark && t < hold.until))) return;
+      release(t - hold.since >= LIT_HOLD_MAX_MS ? 'max' : dark ? 'dark' : 'timeout', t);
+      return wake('heard');
+    }
     if (io.roomSpeaking?.() || io.hostBusy?.()) {
       lastBusyAt = t;
       resetLadder(t);
@@ -364,6 +412,7 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
       const can = sit.present.filter((id) => id !== sit.speaker && state.get(id)?.status !== 'spoke' && (why !== 'lead_goes_first' || id === leadId));
       return { can };
     }
+    if (why === 'speaker_not_started') return { speaker: sit.speaker, hint: 'слово у него, он ещё не начал: подожди' };
     if (a.action === 'ask_done') return sit.speaker ? { speaker: sit.speaker } : { hint: 'круг не начат: сначала give_word' };
     if (a.action === 'leave' || a.action === 'open_floor') return sit.queue.length ? { queue: sit.queue } : {};
     return {};
@@ -403,6 +452,11 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
     return false;
   }
 
+  /** The word is with someone who has not started yet and she gave it less than SPEAKER_START_MS ago. */
+  function speakerNotStarted(sit, ctx, t) {
+    return sit.phase === 'round' && Boolean(sit.speaker) && spokeIn !== sit.speaker && Boolean(state.get(sit.speaker)?.present) && !ctx.how && t - wordGivenAt < SPEAKER_START_MS;
+  }
+
   /** The host's own checks on top of invariants.violation(). */
   function hostCheck(a, sit, ctx) {
     const t = now();
@@ -417,6 +471,7 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
         return null;
       case 'give_word':
         if (state.get(a.person)?.status === 'spoke') return 'already_spoke';
+        if (a.person !== sit.speaker && speakerNotStarted(sit, ctx, t)) return 'speaker_not_started';
         if (a.text && namesSomeoneElse(a.text, sit, a.person)) return 'text_names_someone_else';
         return null;
       case 'ask_done':
@@ -424,6 +479,8 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
         if (askedDoneFor === a.person) return 'already_asked';
         if (t - Math.max(lastHumanAt, lastHerEndAt) < ASK_DONE_MIN_SILENCE_MS) return 'too_early';
         return null;
+      case 'open_floor':
+        return speakerNotStarted(sit, ctx, t) ? 'speaker_not_started' : null;
       default:
         return null;
     }
@@ -518,7 +575,7 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
     tick,
     input,
     situation,
-    stats: () => ({ ...stats, epoch, inflight: Boolean(inflight), pending: pending.length }),
+    stats: () => ({ ...stats, epoch, inflight: Boolean(inflight), pending: pending.length, held: Boolean(hold) }),
     get epoch() {
       return epoch;
     },

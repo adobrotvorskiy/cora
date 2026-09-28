@@ -295,6 +295,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
   let gateSpec = null; // the line speakOne() holds at the floor gate (not playing yet)
   let speechPumpRunning = false;
   let quiet = false; // «Кора, стоп»: no speech out, still listening; lifted by a line addressed to her by name
+  let litIds = []; // people whose Telemost tile is lit now (the agent holds its wake while the author's tile is lit)
   const usage = { alerts: 0 };
   const pendingAlerts = new Set(); // in-flight sendAlert promises, flushed (bounded) in shutdown
 
@@ -756,6 +757,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
       },
       drop: dropAgentLines,
       roomSpeaking: () => floor.active || floor.vadOpen,
+      lit: () => litIds,
       hostBusy: () => hostState.speaking || Boolean(currentSpeech) || speechQueue.length > 0 || Boolean(gateSpec) || Boolean(flow.turnEnd),
       canSpeak: () => floor.canSpeak(wall()),
       quiet: () => quiet,
@@ -1332,6 +1334,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
   function onSpeakers(names) {
     const t = wall();
     const ids = attribution.onDomSpeakers(names, { t });
+    litIds = ids;
     floor.onDomSpeakers(ids, { t });
     ev('page.speaker', { names, ids, presumed: attribution.presumed });
     const cur = attribution.current({ t });
