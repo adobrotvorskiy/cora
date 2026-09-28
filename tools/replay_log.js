@@ -4,7 +4,8 @@
 // the report hold transcripts and stay local (logs/, _internal/ are gitignored).
 //
 //   node tools/replay_log.js logs/testroom_2026-09-27_run2.jsonl [--mode forced|free] [--latency 1200]
-//        [--model aliceai-llm-flash/latest] [--from mm:ss] [--to mm:ss] [--scripted] [--quiet]
+//        [--provider yandex|openrouter] [--model <id>] [--from mm:ss] [--to mm:ss] [--scripted] [--quiet]
+// --provider openrouter --model <Gemini slug>: the same run through another model (compare the summaries).
 //
 // forced (default): people's lines and her ORIGINAL lines at their times, the agent is asked at every
 // wake and its calls are only recorded. free: the agent's own lines replace hers.
@@ -32,6 +33,7 @@ async function main() {
       mode: { type: 'string', default: 'forced' },
       latency: { type: 'string' },
       model: { type: 'string' },
+      provider: { type: 'string' },
       from: { type: 'string' },
       to: { type: 'string' },
       scripted: { type: 'boolean', default: false },
@@ -56,7 +58,7 @@ async function main() {
   const roster = loadRoster();
   const agent = values.scripted
     ? { decide: async () => ({ actions: [{ action: 'skip' }], timings: { done: 1000 } }) } // the event path only, no network
-    : agentFromSettings({ settings: values.model ? { ...settings, agent: { ...(settings.agent ?? {}), model: values.model } } : settings, roster });
+    : agentFromSettings({ settings: { ...settings, agent: { ...(settings.agent ?? {}), ...(values.provider ? { provider: values.provider } : {}), ...(values.model ? { model: values.model } : {}) } }, roster });
   console.log(`${basename(file)}: ${tl.events.filter((e) => e.type === 'heard').length} lines, ${clockOf(tl.duration)}; mode ${values.mode}; agent ${values.scripted ? 'scripted (skip)' : agent.model}\n`);
   const r = await replayTimeline(tl, {
     agent,
@@ -83,7 +85,8 @@ async function main() {
   console.log(`\n${JSON.stringify(r.summary, null, 2)}`);
   const dir = join(APP_ROOT, '_internal');
   mkdirSync(dir, { recursive: true });
-  const out = join(dir, `replay_${basename(file, '.jsonl')}_${values.mode}.json`);
+  const tag = String(agent.model ?? 'scripted').replace(/^gpt:\/\/[^/]+\//, '').replace(/[^\w.-]+/g, '_');
+  const out = join(dir, `replay_${basename(file, '.jsonl')}_${values.mode}_${tag}.json`);
   writeFileSync(out, JSON.stringify({ file: basename(file), mode: values.mode, model: agent.model ?? 'scripted', summary: r.summary, calls: r.calls, lines: r.lines, events: r.events }, null, 2));
   console.log(`report: ${out}`);
   return 0;

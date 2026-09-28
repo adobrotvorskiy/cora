@@ -44,6 +44,8 @@ export const MAX_PREEMPTS = 2;
 export const DEFAULT_BUDGET = Object.freeze({ max_calls: 800, max_tokens: 4_000_000, max_rub: null });
 const DIALOG_KEEP = 40;
 const TURN_TOOLS = new Set(['give_word', 'ask_done', 'open_floor', 'leave']);
+/** «Not yet» refusals: the same call is right a bit later, so repeating it never marks the agent stuck (live 28.09, run 2). */
+const TIMING = new Set(['too_early', 'too_often', 'start_pending', 'turn_change_in_progress', 'closing']);
 const ACTIVE = { waiting: 'waiting', starting: 'waiting', round: 'round', open_floor: 'open_floor' };
 /** «повтори», «не расслышал»: saying her line again is what they asked for. */
 const REPEAT_ASK_RE = /повтор|ещё раз|еще раз|не расслыш|не услыш|не понял/iu;
@@ -370,7 +372,7 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
     ev('agent.rejected', { tool: a.action, reason: why, ...(a.person ? { person: a.person } : {}), ...(a.text ? { text: a.text } : {}) });
     push({ type: 'rejected', tool: a.action === 'unknown' ? a.name : a.action, reason: why, ...(a.person ? { person: a.person } : {}), ...hintFor(a, why, sit) });
     const key = `${a.action}:${a.person ?? ''}:${why}`;
-    if (key === lastRejectKey && !stuck) {
+    if (key === lastRejectKey && !stuck && !TIMING.has(why)) {
       stuck = true;
       ev('agent.stuck', { tool: a.action, reason: why, ...(a.person ? { person: a.person } : {}) });
     }

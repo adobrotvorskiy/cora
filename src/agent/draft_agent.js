@@ -220,13 +220,21 @@ export function createDraftAgent({ endpoint, apiKey, model, system, fetch: fetch
   };
 }
 
+export const AGENT_PROVIDERS = Object.freeze(['yandex', 'openrouter']);
+
 /**
- * The agent for the host (voice.host = "agent"): Yandex AI Studio, key and folder as for the brain
- * (settings.keys.yandex, settings.yandex.folder), model settings.agent.model or brain.yandex_model.
+ * The agent for the host (voice.host = "agent"). settings.agent.provider:
+ * - "yandex" (default): Yandex AI Studio, key and folder as for the brain (settings.keys.yandex,
+ *   settings.yandex.folder), model settings.agent.model or brain.yandex_model;
+ * - "openrouter": any model with tool calls behind OpenRouter (Gemini Flash — the owner's idea of
+ *   28.09, after aliceai-llm-flash kept ignoring the tools' rules), key settings.keys.openrouter, model
+ *   settings.agent.model or brain.openrouter_model.
  * @param {{settings: object, roster: {people: object[], firstAlways?: string|null, teamName?: string|null}, env?: object, fetch?: Function}} o
  */
 export function agentFromSettings({ settings, roster, dayMode = null, env = process.env, fetch: fetchImpl, assets = loadBrainAssets() }) {
-  const sel = resolveProvider(settings, { env, provider: 'yandex', model: settings.agent?.model });
+  const provider = settings.agent?.provider ?? 'yandex';
+  if (!AGENT_PROVIDERS.includes(provider)) throw new Error(`agent.provider must be ${AGENT_PROVIDERS.join('|')}`);
+  const sel = resolveProvider(settings, { env, provider, model: settings.agent?.model });
   const system = agentPrompts({
     assets: { ...assets, people: roster?.people ?? assets.people },
     leadId: roster?.firstAlways ?? assets.firstAlways ?? null,
@@ -236,7 +244,7 @@ export function agentFromSettings({ settings, roster, dayMode = null, env = proc
     model: sel.model,
   });
   const agent = createDraftAgent({
-    endpoint: settings.agent?.endpoint ?? ENDPOINTS.yandex,
+    endpoint: settings.agent?.endpoint ?? ENDPOINTS[provider],
     apiKey: requireKey(sel.keyName, env),
     model: sel.model,
     system,
@@ -244,5 +252,5 @@ export function agentFromSettings({ settings, roster, dayMode = null, env = proc
     temperature: settings.agent?.temperature ?? 0.2,
     ...(fetchImpl ? { fetch: fetchImpl } : {}),
   });
-  return Object.assign(agent, { model: sel.model, provider: 'yandex', prompt: system });
+  return Object.assign(agent, { model: sel.model, provider, prompt: system });
 }

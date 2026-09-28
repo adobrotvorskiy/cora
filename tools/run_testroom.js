@@ -9,6 +9,7 @@
 // (tuning SpeechKit and Smart Turn on real voices; with the consent of everyone in the room).
 // --host agent: the agent on tools decides what to say (docs/agent_plan.md, src/agent/conductor.js);
 // default: the turn automaton + brain (or voice.host from settings.local.json).
+// --agent-provider yandex|openrouter --agent-model <id>: the agent's model (e.g. openrouter + a Gemini Flash slug).
 //
 // Defaults: --at 09:59 (the start timer fires one minute after the join), --day = today if
 // Mon–Thu else mon, --max-minutes 4, Telegram alerts off (pass --alert to enable), timeline on.
@@ -43,13 +44,15 @@ const { values } = parseArgs({
     provider: { type: 'string' },
     record: { type: 'boolean', default: false },
     host: { type: 'string' },
+    'agent-provider': { type: 'string' },
+    'agent-model': { type: 'string' },
     help: { type: 'boolean', short: 'h', default: false },
   },
   strict: true,
 });
 
 if (values.help) {
-  console.log(`node tools/run_testroom.js [--at HH:MM] [--day mon|tue|wed|thu] [--start HH:MM] [--shadow] [--no-brain] [--max-minutes N] [--verbose] [--alert] [--url <test url>] [--provider ${PROVIDERS.join('|')}] [--record] [--host automaton|agent]`);
+  console.log(`node tools/run_testroom.js [--at HH:MM] [--day mon|tue|wed|thu] [--start HH:MM] [--shadow] [--no-brain] [--max-minutes N] [--verbose] [--alert] [--url <test url>] [--provider ${PROVIDERS.join('|')}] [--record] [--host automaton|agent] [--agent-provider yandex|openrouter] [--agent-model <id>]`);
   process.exit(0);
 }
 if (values.provider && !PROVIDERS.includes(values.provider)) {
@@ -79,7 +82,10 @@ if (isRealRoom(values.url)) {
 
 loadEnv();
 const voiceOverride = { ...(values.provider ? { provider: values.provider } : {}), ...(values.host ? { host: values.host } : {}) };
-const settings = loadSettings({ cliOverrides: { meeting_url: values.url, ...(Object.keys(voiceOverride).length ? { voice: voiceOverride } : {}) } });
+const agentOverride = { ...(values['agent-provider'] ? { provider: values['agent-provider'] } : {}), ...(values['agent-model'] ? { model: values['agent-model'] } : {}) };
+const settings = loadSettings({
+  cliOverrides: { meeting_url: values.url, ...(Object.keys(voiceOverride).length ? { voice: voiceOverride } : {}), ...(Object.keys(agentOverride).length ? { agent: agentOverride } : {}) },
+});
 settings.times = values.start ? deriveTimes(values.start, settings.times ?? {}) : null; // no --start = on-demand mode
 const agentMode = settings.voice?.provider === 'elevenlabs_agent' || settings.voice?.provider === 'yandex_rt';
 const today = clock.dayMode();
@@ -121,7 +127,7 @@ function line(rec) {
   return `${rel}s ${rec.t_msk.slice(0, 8)} ${rec.type.padEnd(22)} ${parts.join(' ')}`;
 }
 
-console.log(`test room: ${values.url}\nsimulated ${day} ${values.at} MSK, mode=${values.start ? `scheduled --start ${values.start}` : 'on-demand'}, provider=${settings.voice?.provider}${settings.voice?.host === 'agent' ? ' host=agent' : ''}, shadow=${flags.shadow}, brain=${flags.brain}, max ${flags.maxMinutes} min, alerts=${flags.alert}\nlog: ${log.path}\nCtrl+C = leave and exit\n`);
+console.log(`test room: ${values.url}\nsimulated ${day} ${values.at} MSK, mode=${values.start ? `scheduled --start ${values.start}` : 'on-demand'}, provider=${settings.voice?.provider}${settings.voice?.host === 'agent' ? ` host=agent (${settings.agent?.provider ?? 'yandex'} ${settings.agent?.model ?? 'default model'})` : ''}, shadow=${flags.shadow}, brain=${flags.brain}, max ${flags.maxMinutes} min, alerts=${flags.alert}\nlog: ${log.path}\nCtrl+C = leave and exit\n`);
 const host = agentMode ? createAgentHost({ settings, flags, log }) : createHost({ settings, flags, log });
 host
   .run()

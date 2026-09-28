@@ -621,6 +621,24 @@ describe('conductor: after the live test of 28.09', () => {
     assert.equal(w.agent.calls.length, n + 1, 'speech wakes her again');
   });
 
+  test('ask_done «too early» on every line never marks her stuck: the 2.5 s stage still asks (live 28.09, run 2)', async () => {
+    const w = makeWorld({ present: ['tkach_t', 'guest_1'], phase: 'round', speaker: 'guest_1', queue: [], names: { guest_1: 'Зоя' } });
+    for (const text of ['буду гулять с кошкой', 'завтра к врачу', 'в четверг к сестре']) {
+      w.heard('guest_1', text);
+      await flush();
+      for (const c of w.agent.open()) c.answer([{ action: 'ask_done', person: 'guest_1' }]);
+      await w.wait(300);
+      for (const c of w.agent.open()) c.answer([{ action: 'ask_done', person: 'guest_1' }]);
+      await flush();
+    }
+    assert.equal(w.find('agent.stuck').length, 0);
+    for (let i = 0; i < 30; i++) {
+      await w.wait(100);
+      for (const c of w.agent.open()) c.answer([{ action: 'ask_done', person: 'guest_1' }]);
+    }
+    assert.ok(w.calls.some((c) => c.tool === 'askDone'), '«Зоя, всё?» after 2.5 s of silence');
+  });
+
   test('«Кора, заканчивай» in the round: leave is allowed; without her name it is not', async () => {
     const w = makeWorld({ present: ['tkach_t', 'guest_1'], phase: 'round', speaker: 'tkach_t', queue: ['guest_1'], names: { guest_1: 'Зоя' } });
     w.heard('tkach_t', 'Кора заканчивай встречу');
