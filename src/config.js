@@ -158,7 +158,8 @@ export function validateSettings(s) {
     if (v.host === 'agent') {
       // the agent (src/agent/conductor.js): Yandex AI Studio (the key and folder of the cascade brain) or OpenRouter
       const ap = s.agent?.provider ?? 'yandex';
-      if (!['yandex', 'openrouter'].includes(ap)) errors.push('agent.provider must be yandex|openrouter');
+      if (!['yandex', 'google', 'openrouter'].includes(ap)) errors.push('agent.provider must be yandex|google|openrouter');
+      if (ap === 'google' && (typeof s.keys?.google !== 'string' || !s.keys.google)) errors.push('keys.google must name the env variable with the Google AI Studio (Gemini API) key');
       if (ap === 'yandex' && (typeof s.yandex?.folder !== 'string' || !s.yandex.folder.trim())) errors.push('yandex.folder must be the cloud folder id for voice.host agent');
       if (v.provider === 'elevenlabs_agent' || v.provider === 'yandex_rt') errors.push(`voice.host agent needs ears and a mouth (yandex_cascade or openrouter), not ${v.provider}`);
     }

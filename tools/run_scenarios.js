@@ -3,8 +3,9 @@
 // agent (src/agent/draft_agent.js) on Yandex AI Studio with tool calls. Network; synthetic data only;
 // key values are never printed. Report: _internal/scenarios_<date>.json (gitignored).
 //
-//   node tools/run_scenarios.js [--provider yandex|openrouter] [--model <id>] [--only id1,id2] [--rounds 3] [--prompt skills|draft] [--verbose]
-// --provider openrouter --model <Gemini slug>: the same suite on another model (key settings.keys.openrouter).
+//   node tools/run_scenarios.js [--provider yandex|google|openrouter] [--model <id>] [--effort low|none|...] [--only id1,id2] [--rounds 3] [--prompt skills|draft] [--verbose]
+// --provider google: Gemini with the Google AI Studio key (settings.keys.google, model brain.google_model;
+// reasoning_effort low unless --effort); openrouter: settings.keys.openrouter + --model <slug>.
 // --prompt skills (default, step 5): persona + the playbook blocks of the phase, from the committed
 // examples (config/*.example.*: the fictional team the scenarios are written on); draft: the base alone.
 //
@@ -29,6 +30,7 @@ async function main() {
     options: {
       model: { type: 'string' },
       provider: { type: 'string' },
+      effort: { type: 'string' },
       only: { type: 'string' },
       rounds: { type: 'string', default: '3' },
       verbose: { type: 'boolean', short: 'v', default: false },
@@ -43,11 +45,11 @@ async function main() {
   const provider = values.provider ?? settings.agent?.provider ?? 'yandex';
   let keyName;
   let model;
-  if (provider === 'openrouter') {
-    keyName = settings.keys?.openrouter;
-    model = values.model ?? settings.agent?.model ?? settings.brain?.openrouter_model;
+  if (provider === 'openrouter' || provider === 'google') {
+    keyName = settings.keys?.[provider];
+    model = values.model ?? settings.agent?.model ?? (provider === 'google' ? settings.brain?.google_model : settings.brain?.openrouter_model);
     if (!keyName || !model) {
-      console.error('need settings.keys.openrouter and --model <OpenRouter model id>');
+      console.error(`need settings.keys.${provider} and --model <model id>`);
       return 64;
     }
   } else {
@@ -76,6 +78,7 @@ async function main() {
     model,
     system,
     timeoutMs: Number(values.timeout),
+    reasoningEffort: values.effort ?? (provider === 'google' ? 'low' : null),
   });
   const only = values.only?.split(',').map((s) => s.trim()).filter(Boolean) ?? null;
   console.log(`${provider} ${model}; prompt ${values.prompt}; ${only?.length ?? SCENARIOS.length} scenarios x ${values.rounds} round(s)\n`);

@@ -4,8 +4,8 @@
 // the report hold transcripts and stay local (logs/, _internal/ are gitignored).
 //
 //   node tools/replay_log.js logs/testroom_2026-09-27_run2.jsonl [--mode forced|free] [--latency 1200]
-//        [--provider yandex|openrouter] [--model <id>] [--from mm:ss] [--to mm:ss] [--scripted] [--quiet]
-// --provider openrouter --model <Gemini slug>: the same run through another model (compare the summaries).
+//        [--provider yandex|google|openrouter] [--model <id>] [--from mm:ss] [--to mm:ss] [--scripted] [--quiet]
+// --provider google: the same run through Gemini (Google AI Studio key) — compare the summaries.
 //
 // forced (default): people's lines and her ORIGINAL lines at their times, the agent is asked at every
 // wake and its calls are only recorded. free: the agent's own lines replace hers.

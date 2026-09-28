@@ -105,4 +105,25 @@ describe('skills: the playbook by phase', () => {
     assert.equal(seen[0].model, 'google/gemini-test-flash');
     assert.throws(() => agentFromSettings({ settings: { ...settings, agent: { provider: 'nope' } }, roster: { people: [] }, env: {}, assets: { people: [] } }), /agent.provider/);
   });
+
+  test('agent.provider google: the Gemini API endpoint with the AI Studio key, low thinking, dropped if refused', async () => {
+    const seen = [];
+    const fetch = async (url, init) => {
+      const body = JSON.parse(init.body);
+      seen.push({ url, auth: init.headers.Authorization, model: body.model, effort: body.reasoning_effort ?? null, system: body.messages[0].content });
+      if (body.reasoning_effort) return new Response('{"error":{"message":"reasoning_effort is not supported for this model"}}', { status: 400 });
+      return new Response(JSON.stringify({ choices: [{ message: { tool_calls: [{ id: 'a', type: 'function', function: { name: 'skip', arguments: '{}' } }] } }] }), { headers: { 'content-type': 'application/json' } });
+    };
+    const settings = { keys: { google: 'X_GEMINI_TEST' }, brain: { google_model: 'gemini-test-flash' }, agent: { provider: 'google' }, voice: {} };
+    const assets = { people: [], playbook: null, personaBlock: 'Решения принимает {brain_model}.' };
+    const agent = agentFromSettings({ settings, roster: { people: [], firstAlways: null }, env: { X_GEMINI_TEST: 'k-g' }, fetch, assets });
+    await agent.decide({ phase: 'waiting', present: ['a'], events: [] });
+    await agent.decide({ phase: 'waiting', present: ['a'], events: [] });
+    assert.equal(agent.provider, 'google');
+    assert.match(seen[0].url, /generativelanguage\.googleapis\.com\/v1beta\/openai\/chat\/completions$/);
+    assert.equal(seen[0].auth, 'Bearer k-g');
+    assert.equal(seen[0].model, 'gemini-test-flash');
+    assert.deepEqual(seen.map((x) => x.effort), ['low', null, null], 'refused once, never sent again');
+    assert.match(seen[1].system, /Gemini Test Flash от Google/);
+  });
 });

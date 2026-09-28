@@ -9,7 +9,8 @@
 // (tuning SpeechKit and Smart Turn on real voices; with the consent of everyone in the room).
 // --host agent: the agent on tools decides what to say (docs/agent_plan.md, src/agent/conductor.js);
 // default: the turn automaton + brain (or voice.host from settings.local.json).
-// --agent-provider yandex|openrouter --agent-model <id>: the agent's model (e.g. openrouter + a Gemini Flash slug).
+// --agent-provider yandex|google|openrouter --agent-model <id>: the agent's model (google: Gemini with the
+// Google AI Studio key, settings.keys.google).
 //
 // Defaults: --at 09:59 (the start timer fires one minute after the join), --day = today if
 // Mon–Thu else mon, --max-minutes 4, Telegram alerts off (pass --alert to enable), timeline on.
@@ -52,7 +53,7 @@ const { values } = parseArgs({
 });
 
 if (values.help) {
-  console.log(`node tools/run_testroom.js [--at HH:MM] [--day mon|tue|wed|thu] [--start HH:MM] [--shadow] [--no-brain] [--max-minutes N] [--verbose] [--alert] [--url <test url>] [--provider ${PROVIDERS.join('|')}] [--record] [--host automaton|agent] [--agent-provider yandex|openrouter] [--agent-model <id>]`);
+  console.log(`node tools/run_testroom.js [--at HH:MM] [--day mon|tue|wed|thu] [--start HH:MM] [--shadow] [--no-brain] [--max-minutes N] [--verbose] [--alert] [--url <test url>] [--provider ${PROVIDERS.join('|')}] [--record] [--host automaton|agent] [--agent-provider yandex|google|openrouter] [--agent-model <id>]`);
   process.exit(0);
 }
 if (values.provider && !PROVIDERS.includes(values.provider)) {

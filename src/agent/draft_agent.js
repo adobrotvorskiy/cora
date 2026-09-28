@@ -167,12 +167,14 @@ export function toActions(toolCalls, content = '') {
  * @param {number} [o.timeoutMs]
  * @param {boolean} [o.stream]
  * @param {number} [o.temperature]
+ * @param {string|null} [o.reasoningEffort]  reasoning_effort for models that think (Gemini): less thinking, faster answers
  */
-export function createDraftAgent({ endpoint, apiKey, model, system, fetch: fetchImpl = globalThis.fetch, timeoutMs = 15_000, stream = true, temperature = 0.2 }) {
+export function createDraftAgent({ endpoint, apiKey, model, system, fetch: fetchImpl = globalThis.fetch, timeoutMs = 15_000, stream = true, temperature = 0.2, reasoningEffort = null }) {
   let toolChoice = 'required';
   let plainTools = false; // the server refused enum in the tool schema: plain ids from then on
+  let effort = reasoningEffort; // dropped for good if the server refuses it
   async function post(input, signal) {
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < 4; attempt++) {
       const started = performance.now();
       const res = await fetchImpl(endpoint, {
         method: 'POST',
@@ -184,6 +186,7 @@ export function createDraftAgent({ endpoint, apiKey, model, system, fetch: fetch
           tool_choice: toolChoice,
           temperature,
           max_tokens: 400,
+          ...(effort ? { reasoning_effort: effort } : {}),
           ...(stream ? { stream: true } : {}),
         }),
         signal: signal ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]) : AbortSignal.timeout(timeoutMs),
@@ -192,6 +195,10 @@ export function createDraftAgent({ endpoint, apiKey, model, system, fetch: fetch
       const text = (await res.text().catch(() => '')).slice(0, 400);
       if (res.status === 400 && toolChoice === 'required' && /tool_choice|required/i.test(text)) {
         toolChoice = 'auto'; // AI Studio may refuse "required": fall back once, for the whole session
+        continue;
+      }
+      if (res.status === 400 && effort && /reasoning|thinking/i.test(text)) {
+        effort = null;
         continue;
       }
       if (res.status === 400 && !plainTools && /enum|schema|parameters/i.test(text)) {
@@ -220,14 +227,17 @@ export function createDraftAgent({ endpoint, apiKey, model, system, fetch: fetch
   };
 }
 
-export const AGENT_PROVIDERS = Object.freeze(['yandex', 'openrouter']);
+export const AGENT_PROVIDERS = Object.freeze(['yandex', 'google', 'openrouter']);
 
 /**
  * The agent for the host (voice.host = "agent"). settings.agent.provider:
  * - "yandex" (default): Yandex AI Studio, key and folder as for the brain (settings.keys.yandex,
  *   settings.yandex.folder), model settings.agent.model or brain.yandex_model;
- * - "openrouter": any model with tool calls behind OpenRouter (Gemini Flash — the owner's idea of
- *   28.09, after aliceai-llm-flash kept ignoring the tools' rules), key settings.keys.openrouter, model
+ * - "google": Gemini through the Gemini API with a Google AI Studio key (the owner's choice of 28.09,
+ *   after aliceai-llm-flash kept ignoring the tools' rules), its OpenAI-compatible endpoint; key
+ *   settings.keys.google, model settings.agent.model or brain.google_model; thinking kept low
+ *   (agent.reasoning_effort, default "low" — dropped if the model refuses it);
+ * - "openrouter": any model with tool calls behind OpenRouter, key settings.keys.openrouter, model
  *   settings.agent.model or brain.openrouter_model.
  * @param {{settings: object, roster: {people: object[], firstAlways?: string|null, teamName?: string|null}, env?: object, fetch?: Function}} o
  */
@@ -241,7 +251,7 @@ export function agentFromSettings({ settings, roster, dayMode = null, env = proc
     team: roster?.teamName ?? assets.teamName ?? null,
     scheduled: Boolean(settings.times?.start),
     dayMode,
-    model: sel.model,
+    model: provider === 'google' && !sel.model.includes('/') ? `google/${sel.model}` : sel.model, // «Gemini … от Google» in the persona
   });
   const agent = createDraftAgent({
     endpoint: settings.agent?.endpoint ?? ENDPOINTS[provider],
@@ -250,6 +260,7 @@ export function agentFromSettings({ settings, roster, dayMode = null, env = proc
     system,
     timeoutMs: settings.agent?.timeout_ms ?? 8000,
     temperature: settings.agent?.temperature ?? 0.2,
+    reasoningEffort: settings.agent?.reasoning_effort ?? (provider === 'google' ? 'low' : null),
     ...(fetchImpl ? { fetch: fetchImpl } : {}),
   });
   return Object.assign(agent, { model: sel.model, provider, prompt: system });

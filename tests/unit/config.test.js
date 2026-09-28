@@ -57,7 +57,7 @@ test('committed settings.json: no links or chat ids in git; valid once the local
   assert.equal(s.voice.tts_model, 'openai/gpt-audio-mini');
   assert.equal(s.voice.voice, 'shimmer');
   assert.equal(typeof s.voice.stt_model, 'string');
-  assert.deepEqual(s.keys, { openai: 'OPENAI_API_KEY', openrouter: 'Cora_KEY', elevenlabs: 'Elevenlabs_Cora_API', yandex: 'key', yandex_folder: 'id', telegram: 'TELEGRAM_BOT_TOKEN' });
+  assert.deepEqual(s.keys, { openai: 'OPENAI_API_KEY', openrouter: 'Cora_KEY', google: 'GEMINI_API_KEY', elevenlabs: 'Elevenlabs_Cora_API', yandex: 'key', yandex_folder: 'id', telegram: 'TELEGRAM_BOT_TOKEN' });
   assert.equal(typeof s.yandex.voice, 'string');
   assert.equal(typeof s.yandex.model, 'string');
   assert.equal(s.voice.eleven_voice_id, 'YjESejviApN7SHrbfnA2');
@@ -114,6 +114,14 @@ test('validateSettings: voice.host agent needs the AI Studio folder and ears; ag
   assert.ok(errors.includes('voice.host agent needs ears and a mouth (yandex_cascade or openrouter), not elevenlabs_agent'));
   assert.ok(errors.includes('agent.timeout_ms must be a number'));
   assert.ok(errors.includes('agent.budget must be an object {max_calls, max_tokens, max_rub}'));
+  const g = { ...committed(), meeting_url: 'https://telemost.yandex.ru/j/11111111111111111111111111111111111111' };
+  g.voice.host = 'agent';
+  g.agent = { provider: 'google' };
+  assert.deepEqual(validateSettings(g).errors, [], 'google needs no Yandex folder; keys.google is in settings.json');
+  delete g.keys.google;
+  assert.ok(validateSettings(g).errors.includes('keys.google must name the env variable with the Google AI Studio (Gemini API) key'));
+  g.agent = { provider: 'gigachat' };
+  assert.ok(validateSettings(g).errors.includes('agent.provider must be yandex|google|openrouter'));
   const t = committed();
   t.voice.host = 'robot';
   assert.ok(validateSettings(t).errors.includes('voice.host must be automaton|agent'));

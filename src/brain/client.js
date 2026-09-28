@@ -48,6 +48,8 @@ export const ENDPOINTS = Object.freeze({
   openrouter: 'https://openrouter.ai/api/v1/chat/completions',
   openai: 'https://api.openai.com/v1/chat/completions',
   yandex: 'https://ai.api.cloud.yandex.net/v1/chat/completions',
+  // Gemini API (a Google AI Studio key), its OpenAI-compatible endpoint: used by the agent (agent.provider "google")
+  google: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
 });
 /** Env names the host must never use: the shared OpenRouter key belongs to other tools. */
 export const FORBIDDEN_KEY_NAMES = Object.freeze(['OPENROUTER_API_KEY']);
@@ -107,7 +109,7 @@ export function resolveProvider(settings, { env = process.env, provider, model }
   const has = (name) => typeof name === 'string' && name !== '' && hasKey(name, env);
   let sel;
   if (provider) {
-    if (!Object.hasOwn(ENDPOINTS, provider)) throw new Error(`brain: unknown provider "${provider}" (expected openrouter|openai|yandex)`);
+    if (!Object.hasOwn(ENDPOINTS, provider)) throw new Error(`brain: unknown provider "${provider}" (expected ${Object.keys(ENDPOINTS).join('|')})`);
     const keyName = keys[provider];
     if (!has(keyName)) throw new Error(`brain: provider ${provider} requested but ${keyName ?? `settings.keys.${provider}`} is absent`);
     sel = { provider, keyName, model: model ?? defaultModel(provider, brain) };
@@ -170,6 +172,7 @@ export function initialCaps(provider, model, brain = {}) {
 }
 
 function defaultModel(provider, brain) {
+  if (provider === 'google') return brain.google_model;
   return provider === 'openrouter' ? brain.openrouter_model : brain.openai_fallback_model;
 }
 
