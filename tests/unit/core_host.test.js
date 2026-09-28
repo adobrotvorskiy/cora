@@ -1215,3 +1215,30 @@ describe('host: agent mode after the review of 27.09', () => {
     await h.finish();
   });
 });
+
+describe('host: joining', () => {
+  test('«Звонки сейчас недоступны»: she joins again from the link instead of giving up', async () => {
+    let calls = 0;
+    const h = makeHost({
+      present: ['Тимур Ткач'],
+      deps: {
+        joinRetryPauseMs: 10,
+        telemost: {
+          join: async () => (++calls === 1 ? { status: 'unavailable', detail: 'Звонки сейчас недоступны', tookMs: 5 } : { status: 'joined', tookMs: 5 }),
+          installObservers: async () => async () => {},
+          getParticipants: async () => [],
+          leave: async () => ({ ok: true }),
+          setHideIncomingVideo: async () => ({}),
+          closePanels: async () => {},
+        },
+      },
+    });
+    const t0 = Date.now();
+    while (!h.find('join.result').length && Date.now() - t0 < 3000) await sleep(20);
+    assert.equal(calls, 2);
+    assert.equal(h.find('join.retry').length, 1);
+    assert.equal(h.find('join.result')[0].status, 'joined');
+    await h.finish();
+  });
+});
+

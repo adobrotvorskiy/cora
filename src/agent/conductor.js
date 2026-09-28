@@ -332,7 +332,9 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
       name_ms: tm.first_tool_name ?? null,
       done_ms: tm.done ?? Math.round(now() - req.t),
       tokens: tin + tout || null,
+      ...(out?.fallback ? { fallback: out.fallback } : {}),
     });
+    if (out?.fallback) stats.fallbacks = (stats.fallbacks ?? 0) + 1;
     const stale = req.epoch < epoch;
     const protectedStale = stale && preempts >= MAX_PREEMPTS && io.canSpeak?.() !== false;
     preempts = 0;

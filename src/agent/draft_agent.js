@@ -169,13 +169,15 @@ export function toActions(toolCalls, content = '') {
  * @param {number} [o.temperature]
  * @param {string|null} [o.reasoningEffort]  reasoning_effort for models that think (Gemini): less thinking, faster answers
  * @param {number} [o.maxTokens]  output cap; a thinking model spends part of it on thoughts (Gemini: 2048)
+ * @param {boolean} [o.streamUsage]  ask for token usage in the stream (stream_options.include_usage; Gemini sends none otherwise)
  */
-export function createDraftAgent({ endpoint, apiKey, model, system, fetch: fetchImpl = globalThis.fetch, timeoutMs = 15_000, stream = true, temperature = 0.2, reasoningEffort = null, maxTokens = 400 }) {
+export function createDraftAgent({ endpoint, apiKey, model, system, fetch: fetchImpl = globalThis.fetch, timeoutMs = 15_000, stream = true, temperature = 0.2, reasoningEffort = null, maxTokens = 400, streamUsage = false }) {
   let toolChoice = 'required';
   let plainTools = false; // the server refused enum in the tool schema: plain ids from then on
   let effort = reasoningEffort; // dropped for good if the server refuses it
+  let usageOpt = streamUsage; // dropped for good if the server refuses it
   async function post(input, signal) {
-    for (let attempt = 0; attempt < 4; attempt++) {
+    for (let attempt = 0; attempt < 5; attempt++) {
       const started = performance.now();
       const res = await fetchImpl(endpoint, {
         method: 'POST',
@@ -188,7 +190,7 @@ export function createDraftAgent({ endpoint, apiKey, model, system, fetch: fetch
           temperature,
           max_tokens: maxTokens,
           ...(effort ? { reasoning_effort: effort } : {}),
-          ...(stream ? { stream: true } : {}),
+          ...(stream ? { stream: true, ...(usageOpt ? { stream_options: { include_usage: true } } : {}) } : {}),
         }),
         signal: signal ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]) : AbortSignal.timeout(timeoutMs),
       });
@@ -196,6 +198,10 @@ export function createDraftAgent({ endpoint, apiKey, model, system, fetch: fetch
       const text = (await res.text().catch(() => '')).slice(0, 400);
       if (res.status === 400 && toolChoice === 'required' && /tool_choice|required/i.test(text)) {
         toolChoice = 'auto'; // AI Studio may refuse "required": fall back once, for the whole session
+        continue;
+      }
+      if (res.status === 400 && usageOpt && /stream_options|include_usage/i.test(text)) {
+        usageOpt = false;
         continue;
       }
       if (res.status === 400 && effort && /reasoning|thinking/i.test(text)) {
@@ -242,7 +248,58 @@ export const AGENT_PROVIDERS = Object.freeze(['yandex', 'google', 'openrouter'])
  *   settings.agent.model or brain.openrouter_model.
  * @param {{settings: object, roster: {people: object[], firstAlways?: string|null, teamName?: string|null}, env?: object, fetch?: Function}} o
  */
-export function agentFromSettings({ settings, roster, dayMode = null, env = process.env, fetch: fetchImpl, assets = loadBrainAssets() }) {
+export function agentFromSettings({ settings, roster, dayMode = null, env = process.env, fetch: fetchImpl, assets = loadBrainAssets(), log = null, now = () => Date.now() }) {
+  const primary = oneAgent({ settings, roster, dayMode, env, fetchImpl, assets });
+  // a cloud model that is overloaded or out of quota (live 28.09, Gemini: 503 and 429 on 18 of 21 calls) must not
+  // leave her mute: the decision goes to the fallback (Yandex by default), and for a while every decision does
+  const fb = settings.agent?.fallback === undefined ? (primary.provider === 'yandex' ? null : 'yandex') : settings.agent.fallback;
+  if (!fb || fb === primary.provider) return primary;
+  let secondary = null;
+  try {
+    secondary = oneAgent({ settings: { ...settings, agent: { ...(settings.agent ?? {}), provider: fb, model: undefined, reasoning_effort: undefined, max_tokens: undefined } }, roster, dayMode, env, fetchImpl, assets });
+  } catch (e) {
+    log?.event?.('agent.fallback_unavailable', { provider: fb, message: String(e?.message ?? e).slice(0, 200) });
+    return primary;
+  }
+  return withFallback(primary, secondary, { log, now });
+}
+
+/** Status codes worth moving to the fallback for: overloaded, out of quota, down. */
+const retryable = (e) => e?.status === 429 || (e?.status >= 500 && e?.status < 600) || e?.name === 'TimeoutError' || e?.name === 'TypeError';
+const COOLDOWN_MS = { 429: 60_000, default: 20_000 };
+
+/**
+ * The primary agent, and the secondary one when it fails (429 / 5xx / timeout / network). After a failure the
+ * secondary answers directly for a cooldown (60 s after 429, 20 s otherwise), then the primary is tried again.
+ * The result carries fallback: {from, to, reason}.
+ */
+export function withFallback(primary, secondary, { log = null, now = () => Date.now() } = {}) {
+  let coolUntil = 0;
+  let lastReason = null;
+  const tag = (r, reason) => ({ ...r, fallback: { from: primary.provider, to: secondary.provider, reason } });
+  return {
+    model: primary.model,
+    provider: primary.provider,
+    prompt: primary.prompt,
+    get toolChoice() {
+      return primary.toolChoice;
+    },
+    async decide(input, o = {}) {
+      if (now() < coolUntil) return tag(await secondary.decide(input, o), lastReason);
+      try {
+        return await primary.decide(input, o);
+      } catch (e) {
+        if (o.signal?.aborted || !retryable(e)) throw e;
+        lastReason = e.status ?? e.name;
+        coolUntil = now() + (COOLDOWN_MS[e.status] ?? COOLDOWN_MS.default);
+        log?.event?.('agent.fallback', { from: primary.provider, to: secondary.provider, reason: lastReason, cooldown_ms: coolUntil - now(), message: String(e?.message ?? e).slice(0, 160) });
+        return tag(await secondary.decide(input, o), lastReason);
+      }
+    },
+  };
+}
+
+function oneAgent({ settings, roster, dayMode, env, fetchImpl, assets }) {
   const provider = settings.agent?.provider ?? 'yandex';
   if (!AGENT_PROVIDERS.includes(provider)) throw new Error(`agent.provider must be ${AGENT_PROVIDERS.join('|')}`);
   const sel = resolveProvider(settings, { env, provider, model: settings.agent?.model });
@@ -263,6 +320,7 @@ export function agentFromSettings({ settings, roster, dayMode = null, env = proc
     temperature: settings.agent?.temperature ?? 0.2,
     reasoningEffort: settings.agent?.reasoning_effort ?? (provider === 'google' ? 'low' : null),
     maxTokens: settings.agent?.max_tokens ?? (provider === 'google' ? 2048 : 400), // Gemini counts its thoughts in the cap
+    streamUsage: provider !== 'yandex',
     ...(fetchImpl ? { fetch: fetchImpl } : {}),
   });
   return Object.assign(agent, { model: sel.model, provider, prompt: system });

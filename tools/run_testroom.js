@@ -47,13 +47,14 @@ const { values } = parseArgs({
     host: { type: 'string' },
     'agent-provider': { type: 'string' },
     'agent-model': { type: 'string' },
+    'agent-effort': { type: 'string' },
     help: { type: 'boolean', short: 'h', default: false },
   },
   strict: true,
 });
 
 if (values.help) {
-  console.log(`node tools/run_testroom.js [--at HH:MM] [--day mon|tue|wed|thu] [--start HH:MM] [--shadow] [--no-brain] [--max-minutes N] [--verbose] [--alert] [--url <test url>] [--provider ${PROVIDERS.join('|')}] [--record] [--host automaton|agent] [--agent-provider yandex|google|openrouter] [--agent-model <id>]`);
+  console.log(`node tools/run_testroom.js [--at HH:MM] [--day mon|tue|wed|thu] [--start HH:MM] [--shadow] [--no-brain] [--max-minutes N] [--verbose] [--alert] [--url <test url>] [--provider ${PROVIDERS.join('|')}] [--record] [--host automaton|agent] [--agent-provider yandex|google|openrouter] [--agent-model <id>] [--agent-effort none|minimal|low]`);
   process.exit(0);
 }
 if (values.provider && !PROVIDERS.includes(values.provider)) {
@@ -83,7 +84,11 @@ if (isRealRoom(values.url)) {
 
 loadEnv();
 const voiceOverride = { ...(values.provider ? { provider: values.provider } : {}), ...(values.host ? { host: values.host } : {}) };
-const agentOverride = { ...(values['agent-provider'] ? { provider: values['agent-provider'] } : {}), ...(values['agent-model'] ? { model: values['agent-model'] } : {}) };
+const agentOverride = {
+  ...(values['agent-provider'] ? { provider: values['agent-provider'] } : {}),
+  ...(values['agent-model'] ? { model: values['agent-model'] } : {}),
+  ...(values['agent-effort'] ? { reasoning_effort: values['agent-effort'] } : {}),
+};
 const settings = loadSettings({
   cliOverrides: { meeting_url: values.url, ...(Object.keys(voiceOverride).length ? { voice: voiceOverride } : {}), ...(Object.keys(agentOverride).length ? { agent: agentOverride } : {}) },
 });

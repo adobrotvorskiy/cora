@@ -98,6 +98,8 @@ export const SEL = {
     denied: /только (для )?сотрудник|доступ (ограничен|запрещ)|нет доступа|не удалось подключиться|отклон(ил|ён|ена)/i,
     ended: /встреча (завершена|закончилась)|конференция завершена|вы вышли|покинули встречу|организатор завершил/i,
     notFound: /не найдена|не существует|неверная ссылка|ссылка недействительна/i,
+    // the call service failed to connect (live 28.09: SIGNALING_FAILED 3106, «Звонки сейчас недоступны» for 3 min)
+    unavailable: /звонки сейчас недоступны|сервис (временно )?недоступен|не удалось установить соединение/i,
   },
 };
 
@@ -194,6 +196,8 @@ export async function classifyState(page) {
   if (denied) return { status: 'denied', detail: t(denied).slice(0, 300), url: denied.url };
   const gone = by((i) => SEL.texts.notFound.test(t(i)) || SEL.texts.ended.test(t(i)));
   if (gone) return { status: 'error', detail: t(gone).slice(0, 300), url: gone.url };
+  const down = by((i) => SEL.texts.unavailable.test(t(i)));
+  if (down) return { status: 'unavailable', detail: t(down).slice(0, 300), url: down.url };
   const waiting = by((i) => SEL.texts.waiting.test(t(i)));
   if (waiting) return { status: 'waiting', detail: t(waiting).slice(0, 300), url: waiting.url };
   const joined = by((i) => i.control && !i.prejoin);
@@ -303,7 +307,7 @@ export async function join(page, url, displayName, opts = {}) {
       await stage('joined', st);
       return { ...st, tookMs: Date.now() - t0, waited: sawWaiting };
     }
-    if (st.status === 'denied' || st.status === 'error') { await stage(st.status, st); return { ...st, tookMs: Date.now() - t0 }; }
+    if (st.status === 'denied' || st.status === 'error' || st.status === 'unavailable') { await stage(st.status, st); return { ...st, tookMs: Date.now() - t0 }; }
     if (st.status === 'waiting' && !sawWaiting) { sawWaiting = true; await stage('waiting', st); }
     await sleep(1000);
   }

@@ -62,6 +62,8 @@ const SILENCE_THINK_MIN_MS = 10_000;
 const SPEAK_WAIT_MS = 8000;
 const ADDRESSED_FORCE_MS = 2000; // yandex_cascade: asked by name -> at most this long waiting for a quiet room
 const LEAVE_TIMEOUT_MS = 8000;
+const JOIN_RETRIES = 2; // «Звонки сейчас недоступны»: join again from the link
+const JOIN_RETRY_PAUSE_MS = 5000;
 const CLOSE_TIMEOUT_MS = 10_000;
 const SIGINT_BUDGET_MS = 9000;
 const ALERT_FLUSH_MS = 8000; // shutdown gives fire-and-forget alerts a bounded window to deliver
@@ -1726,7 +1728,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
       if (flags.brain !== false) {
         try {
           const make = D.createAgent ?? (await import('../agent/draft_agent.js')).agentFromSettings;
-          const agent = make({ settings, roster, log, dayMode });
+          const agent = make({ settings, roster, log, dayMode, now: wall });
           conductor = createConductor({
             state,
             agent,
@@ -1846,12 +1848,20 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     clips = await D.loadClips({ settings, mouth: voice.kind === NO_VOICE_KIND ? null : voice.mouth, log });
     if (clips) ev('clips.identity', { ...(clips.identity ?? {}), instructions: undefined, dir: clips.dir ?? null });
 
-    const joinRes = await D.telemost.join(page, url, settings.display_name, {
-      mic: true,
-      camera: Boolean(avatar),
-      waitAdmissionMs: settings.browser?.wait_admission_ms ?? 180_000,
-      log: (e) => ev(e.type ?? 'join', { ...e, type: undefined }),
-    });
+    const joinOnce = () =>
+      D.telemost.join(page, url, settings.display_name, {
+        mic: true,
+        camera: Boolean(avatar),
+        waitAdmissionMs: settings.browser?.wait_admission_ms ?? 180_000,
+        log: (e) => ev(e.type ?? 'join', { ...e, type: undefined }),
+      });
+    let joinRes = await joinOnce();
+    // «Звонки сейчас недоступны» (the call service failed to connect, live 28.09): the next attempt usually works
+    for (let attempt = 1; joinRes.status === 'unavailable' && attempt <= JOIN_RETRIES && !done; attempt++) {
+      ev('join.retry', { attempt, after: joinRes.status, detail: String(joinRes.detail ?? '').slice(0, 160) });
+      await sleep(D.joinRetryPauseMs ?? JOIN_RETRY_PAUSE_MS);
+      joinRes = await joinOnce();
+    }
     ev('join.result', joinRes);
     if (joinRes.status !== 'joined') {
       alert(`не удалось войти в комнату: ${joinRes.status} (${String(joinRes.detail ?? '').slice(0, 160)}), лог ${log.path}`);

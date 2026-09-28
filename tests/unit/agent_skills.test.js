@@ -2,7 +2,7 @@
 // prompt per phase under ~3k tokens, the phase prompt in the request.
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
-import { agentFromSettings, agentPrompts, createDraftAgent } from '../../src/agent/draft_agent.js';
+import { agentFromSettings, agentPrompts, createDraftAgent, withFallback } from '../../src/agent/draft_agent.js';
 import { playbookSkills } from '../../src/agent/skills.js';
 import { estimateTokens } from '../../src/brain/context.js';
 import { loadBrainAssets } from '../../src/brain/prompt.js';
@@ -126,5 +126,54 @@ describe('skills: the playbook by phase', () => {
     assert.deepEqual(seen.map((x) => x.effort), ['low', null, null], 'refused once, never sent again');
     assert.equal(seen[0].max, 2048, 'room for the thoughts before the tool call');
     assert.match(seen[1].system, /Gemini Test Flash от Google/);
+  });
+
+  test('withFallback: 429 / 503 / timeout -> the secondary answers, then directly for the cooldown; aborts and 400 are not retried', async () => {
+    const t = { now: 0 };
+    const events = [];
+    const log = { event: (type, f) => events.push({ type, ...f }) };
+    let primaryCalls = 0;
+    let fail = Object.assign(new Error('HTTP 429: quota'), { status: 429 });
+    const primary = { provider: 'google', model: 'g', decide: async () => { primaryCalls++; if (fail) throw fail; return { actions: [{ action: 'skip' }] }; } };
+    const secondary = { provider: 'yandex', model: 'y', decide: async () => ({ actions: [{ action: 'say', text: 'Привет!' }] }) };
+    const a = withFallback(primary, secondary, { log, now: () => t.now });
+    const r1 = await a.decide({});
+    assert.deepEqual(r1.fallback, { from: 'google', to: 'yandex', reason: 429 });
+    assert.equal(events[0].type, 'agent.fallback');
+    t.now += 30_000;
+    await a.decide({});
+    assert.equal(primaryCalls, 1, 'cooldown: straight to the secondary');
+    t.now += 31_000;
+    fail = null;
+    const r3 = await a.decide({});
+    assert.equal(primaryCalls, 2);
+    assert.equal(r3.fallback, undefined);
+    fail = Object.assign(new Error('HTTP 400: bad'), { status: 400 });
+    await assert.rejects(a.decide({}), /400/);
+    fail = Object.assign(new Error('HTTP 503'), { status: 503 });
+    const ac = new AbortController();
+    ac.abort();
+    await assert.rejects(a.decide({}, { signal: ac.signal }), /503/, 'an aborted decision is not re-asked elsewhere');
+  });
+
+  test('agentFromSettings: Gemini first, Yandex when Gemini is overloaded; Gemini asks for usage in the stream', async () => {
+    const bodies = [];
+    const fetch = async (url, init) => {
+      const body = JSON.parse(init.body);
+      bodies.push({ url, body });
+      if (/googleapis/.test(url)) return new Response('{"error":{"code":503,"message":"high demand"}}', { status: 503 });
+      return new Response(JSON.stringify({ choices: [{ message: { tool_calls: [{ id: 'a', type: 'function', function: { name: 'say', arguments: '{"text":"Слышу!"}' } }] } }] }), { headers: { 'content-type': 'application/json' } });
+    };
+    const settings = { keys: { google: 'X_G', yandex: 'X_Y' }, yandex: { folder: 'f1' }, brain: { google_model: 'gemini-test-flash', yandex_model: 'alice-test' }, agent: { provider: 'google' }, voice: {} };
+    const agent = agentFromSettings({ settings, roster: { people: [] }, env: { X_G: 'kg', X_Y: 'ky' }, fetch, assets: { people: [], playbook: null, personaBlock: null } });
+    const r = await agent.decide({ phase: 'waiting', present: ['a'], events: [] });
+    assert.deepEqual(r.actions, [{ action: 'say', text: 'Слышу!' }]);
+    assert.deepEqual(r.fallback, { from: 'google', to: 'yandex', reason: 503 });
+    assert.deepEqual(bodies[0].body.stream_options, { include_usage: true });
+    assert.match(bodies[1].url, /ai\.api\.cloud\.yandex\.net/);
+    assert.equal(bodies[1].body.model, 'gpt://f1/alice-test');
+    assert.equal(bodies[1].body.stream_options, undefined, 'Yandex gets no stream_options');
+    const alone = agentFromSettings({ settings: { ...settings, agent: { provider: 'google', fallback: null } }, roster: { people: [] }, env: { X_G: 'kg' }, fetch, assets: { people: [], playbook: null, personaBlock: null } });
+    await assert.rejects(alone.decide({ phase: 'waiting', present: ['a'], events: [] }), /503/);
   });
 });
