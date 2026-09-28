@@ -5,7 +5,8 @@
 //
 //   node tools/run_scenarios.js [--provider yandex|google|openrouter] [--model <id>] [--effort low|none|...] [--only id1,id2] [--rounds 3] [--prompt skills|draft] [--verbose]
 // --provider google: Gemini with the Google AI Studio key (settings.keys.google, model brain.google_model;
-// reasoning_effort low unless --effort); openrouter: settings.keys.openrouter + --model <slug>.
+// reasoning_effort low unless --effort); openrouter: settings.keys.openrouter + --model <slug> (--effort none|low|…
+// goes as OpenRouter's reasoning). Latency p50 is printed at the end: compare flash-lite and flash.
 // --prompt skills (default, step 5): persona + the playbook blocks of the phase, from the committed
 // examples (config/*.example.*: the fictional team the scenarios are written on); draft: the base alone.
 //
@@ -79,7 +80,8 @@ async function main() {
     system,
     timeoutMs: Number(values.timeout),
     reasoningEffort: values.effort ?? (provider === 'google' ? 'low' : null),
-    maxTokens: provider === 'google' ? 2048 : 400,
+    reasoningFormat: provider === 'openrouter' ? 'openrouter' : 'openai',
+    maxTokens: provider === 'yandex' ? 400 : 2048,
   });
   const only = values.only?.split(',').map((s) => s.trim()).filter(Boolean) ?? null;
   console.log(`${provider} ${model}; prompt ${values.prompt}; ${only?.length ?? SCENARIOS.length} scenarios x ${values.rounds} round(s)\n`);

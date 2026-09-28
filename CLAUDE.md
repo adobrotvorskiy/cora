@@ -179,7 +179,7 @@ Node-процесс заходит в Телемост через Chrome (`playw
   - Модель агента — `agent.provider`:
     - `yandex` (по умолчанию, Yandex AI Studio);
     - `google` — Gemini API, ключ Google AI Studio в env `GEMINI_API_KEY`. Имя переменной задаёт `keys.google`; модель — `agent.model` или `brain.google_model` (`gemini-3.6-flash`); эндпоинт OpenAI-совместимый (`generativelanguage.googleapis.com/v1beta/openai`); `reasoning_effort: "low"`, если модель не примет — без него;
-    - `openrouter` — `agent.model` в виде slug OpenRouter, ключ `keys.openrouter`.
+    - `openrouter` — `agent.model` в виде slug OpenRouter, ключ `keys.openrouter`. `agent.reasoning_effort` уходит как `reasoning: {effort}`, `none` — как `reasoning: {enabled: false}`. Лимит ответа у всех, кроме `yandex`, — 2048 токенов: думающая модель тратит его на размышления (28.09 `gemini-3.8-flash` на лимите 400 один раз вернула пустой ответ).
   - В инструментах: `run_testroom.js --agent-provider google [--agent-model <id>]`, `run_scenarios.js --provider google [--model <id>] [--effort low|none]`, `replay_log.js --provider google`.
   - Бюджет: `agent.budget` `{max_calls: 800, max_tokens: 4e6, max_rub}`. Тариф AI Studio для рублей (`agent.pricing`) не задан — сверить.
   - Лог: `agent.wake` (что она увидела), `agent.decision` (вызовы, `name_ms`, `done_ms`, токены), `agent.rejected`, `agent.dropped`, `agent.aborted`, в `cost.summary` — `agent`.

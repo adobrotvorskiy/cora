@@ -170,8 +170,10 @@ export function toActions(toolCalls, content = '') {
  * @param {string|null} [o.reasoningEffort]  reasoning_effort for models that think (Gemini): less thinking, faster answers
  * @param {number} [o.maxTokens]  output cap; a thinking model spends part of it on thoughts (Gemini: 2048)
  * @param {boolean} [o.streamUsage]  ask for token usage in the stream (stream_options.include_usage; Gemini sends none otherwise)
+ * @param {'openai'|'openrouter'} [o.reasoningFormat]  how the effort is sent: reasoning_effort (Gemini API), or
+ *   OpenRouter's reasoning: {effort} / {enabled: false} for "none"
  */
-export function createDraftAgent({ endpoint, apiKey, model, system, fetch: fetchImpl = globalThis.fetch, timeoutMs = 15_000, stream = true, temperature = 0.2, reasoningEffort = null, maxTokens = 400, streamUsage = false }) {
+export function createDraftAgent({ endpoint, apiKey, model, system, fetch: fetchImpl = globalThis.fetch, timeoutMs = 15_000, stream = true, temperature = 0.2, reasoningEffort = null, maxTokens = 400, streamUsage = false, reasoningFormat = 'openai' }) {
   let toolChoice = 'required';
   let plainTools = false; // the server refused enum in the tool schema: plain ids from then on
   let effort = reasoningEffort; // dropped for good if the server refuses it
@@ -189,7 +191,7 @@ export function createDraftAgent({ endpoint, apiKey, model, system, fetch: fetch
           tool_choice: toolChoice,
           temperature,
           max_tokens: maxTokens,
-          ...(effort ? { reasoning_effort: effort } : {}),
+          ...(effort ? (reasoningFormat === 'openrouter' ? { reasoning: effort === 'none' ? { enabled: false } : { effort } } : { reasoning_effort: effort }) : {}),
           ...(stream ? { stream: true, ...(usageOpt ? { stream_options: { include_usage: true } } : {}) } : {}),
         }),
         signal: signal ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]) : AbortSignal.timeout(timeoutMs),
@@ -319,7 +321,10 @@ function oneAgent({ settings, roster, dayMode, env, fetchImpl, assets }) {
     timeoutMs: settings.agent?.timeout_ms ?? 8000,
     temperature: settings.agent?.temperature ?? 0.2,
     reasoningEffort: settings.agent?.reasoning_effort ?? (provider === 'google' ? 'low' : null),
-    maxTokens: settings.agent?.max_tokens ?? (provider === 'google' ? 2048 : 400), // Gemini counts its thoughts in the cap
+    reasoningFormat: provider === 'openrouter' ? 'openrouter' : 'openai',
+    // thinking models count their thoughts in the cap (live 28.09, gemini-3.8-flash via OpenRouter: ~180 tokens of
+    // thought per decision, one empty answer at the 400 cap)
+    maxTokens: settings.agent?.max_tokens ?? (provider === 'yandex' ? 400 : 2048),
     streamUsage: provider !== 'yandex',
     ...(fetchImpl ? { fetch: fetchImpl } : {}),
   });

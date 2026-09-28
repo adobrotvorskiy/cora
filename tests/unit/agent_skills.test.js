@@ -176,4 +176,22 @@ describe('skills: the playbook by phase', () => {
     const alone = agentFromSettings({ settings: { ...settings, agent: { provider: 'google', fallback: null } }, roster: { people: [] }, env: { X_G: 'kg' }, fetch, assets: { people: [], playbook: null, personaBlock: null } });
     await assert.rejects(alone.decide({ phase: 'waiting', present: ['a'], events: [] }), /503/);
   });
+
+  test('OpenRouter: reasoning in its own format ({enabled: false} for none), cap 2048 for thinking models', async () => {
+    const bodies = [];
+    const fetch = async (url, init) => {
+      bodies.push(JSON.parse(init.body));
+      return new Response(JSON.stringify({ choices: [{ message: { tool_calls: [{ id: 'a', type: 'function', function: { name: 'skip', arguments: '{}' } }] } }] }), { headers: { 'content-type': 'application/json' } });
+    };
+    const base = { keys: { openrouter: 'X_OR' }, brain: { openrouter_model: 'google/x-flash' }, voice: {} };
+    const assets = { people: [], playbook: null, personaBlock: null };
+    const none = agentFromSettings({ settings: { ...base, agent: { provider: 'openrouter', reasoning_effort: 'none', fallback: null } }, roster: { people: [] }, env: { X_OR: 'k' }, fetch, assets });
+    await none.decide({ phase: 'waiting', present: ['a'], events: [] });
+    const low = agentFromSettings({ settings: { ...base, agent: { provider: 'openrouter', reasoning_effort: 'low', fallback: null } }, roster: { people: [] }, env: { X_OR: 'k' }, fetch, assets });
+    await low.decide({ phase: 'waiting', present: ['a'], events: [] });
+    assert.deepEqual(bodies[0].reasoning, { enabled: false });
+    assert.deepEqual(bodies[1].reasoning, { effort: 'low' });
+    assert.equal(bodies[0].reasoning_effort, undefined);
+    assert.equal(bodies[0].max_tokens, 2048);
+  });
 });
