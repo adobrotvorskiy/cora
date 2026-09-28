@@ -65,7 +65,8 @@ export function questionToHost(text, { mentionsHost, phase, openFloorAsked = fal
  */
 export function mayAnswer(text, { mentionsHost, present, sinceOwnLineMs = Infinity }) {
   if (mentionsHost(text)) return 'name';
-  if (present <= 2) return 'small_group';
+  // a small group: a question, «ты», or a reply to her line (live 28.09: she answered chit-chat between two people)
+  if (present <= 2 && (looksLikeQuestion(text) || YOU_RE.test(text) || QUESTION_NEAR_START_RE.test(text) || sinceOwnLineMs < OWN_UTTERANCE_WINDOW_MS)) return 'small_group';
   if (sinceOwnLineMs < OWN_UTTERANCE_WINDOW_MS && YOU_RE.test(text)) return 'after_own_utterance';
   if (looksLikeQuestion(text) && AI_RE.test(text)) return 'about_ai';
   return null;

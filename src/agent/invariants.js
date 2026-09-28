@@ -2,8 +2,9 @@
 // One list for the scenario runner (a violation fails the step) and the agent host (a violation
 // rejects the call and the agent gets `rejected {tool, reason}` on its next wake).
 //
-//   violation(action, situation, {leadId}) -> null | reason
-//   situation = {phase, speaker, queue, present}
+//   violation(action, situation, {leadId, askedByName}) -> null | reason
+//   situation = {phase, speaker, queue, present}; askedByName: a line she answers named her
+//   («Кора, заканчивай»: she may say goodbye before the round is over — live 28.09)
 
 /** «Тима, продолжай» after an answer (live 27.09, run 2): the host returns the floor itself. */
 export const NO_BRIDGE = /,\s*продолжа/i;
@@ -15,10 +16,10 @@ export const MAX_TEXT_CHARS = 220;
 /**
  * @param {{action: string, person?: string|null, text?: string|null}} a
  * @param {{phase: string, speaker?: string|null, queue?: string[], present?: string[]}} sit
- * @param {{leadId?: string|null}} [opts]
+ * @param {{leadId?: string|null, askedByName?: boolean}} [opts]
  * @returns {string|null} why the action is not allowed
  */
-export function violation(a, sit, { leadId = null } = {}) {
+export function violation(a, sit, { leadId = null, askedByName = false } = {}) {
   const present = new Set(sit.present ?? []);
   const text = typeof a.text === 'string' ? a.text : '';
   if (text) {
@@ -40,7 +41,7 @@ export function violation(a, sit, { leadId = null } = {}) {
       if (sit.phase !== 'round') return 'not_in_round';
       return (sit.queue ?? []).some((id) => present.has(id) && id !== sit.speaker) ? 'queue_not_empty' : null;
     case 'leave':
-      return sit.phase === 'open_floor' || !present.size ? null : 'round_not_finished';
+      return sit.phase === 'open_floor' || !present.size || askedByName ? null : 'round_not_finished';
     default:
       return null;
   }

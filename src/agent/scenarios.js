@@ -4,7 +4,7 @@
 // (src/agent/scenario_runner.js; real model: tools/run_scenarios.js).
 //
 // Scenario: {id, title, source, state: {phase, speaker, queue, present}, dialog: [{who, text}],
-//            steps: [{events, expect, forbid?, level?, ideal, note?}]}
+//            names?: {guest id: name}, steps: [{events, expect, forbid?, level?, ideal, note?}]}
 // Events: heard {who, text} — as SpeechKit gives it after stt_fixes: lower case, no punctuation, «Кора»
 //         restored (heard() does it; heardRaw() keeps a text as written, e.g. a misheard name) ·
 //         silence {ms} · joined / left {who} · her_line_done {text, cut?}
@@ -398,6 +398,57 @@ export const SCENARIOS = Object.freeze([
         expect: [SILENT],
         forbid: [say(/все высказались|добавить/i)],
         ideal: [{ action: 'skip' }],
+      },
+    ],
+  },
+
+  // ---- live test 28.09 (agent host, one person + a guest) ---------------------------------------------
+  {
+    id: 'start_on_reply_with_guest',
+    title: 'на встрече один из команды и гость; «давай начнём» в ответ на её реплику: слово тому, кто на встрече, и только через give_word',
+    source: 'run3',
+    names: { guest_1: 'Зоя' },
+    state: { phase: 'waiting', speaker: null, queue: [], present: ['tkach_t', 'guest_1'] },
+    dialog: [
+      { who: 'tkach_t', text: 'Кора привет' },
+      { who: 'host', text: 'Привет, Тима! Готова начать, когда скажешь.' },
+    ],
+    steps: [
+      {
+        events: [heard('tkach_t', 'да хорошо давай начнём')],
+        expect: [[give(['tkach_t', 'guest_1'])]],
+        forbid: [say(/слово|начн|расскаж/i), give(['orlov_y', 'nevsky_g', 'belozersky_s'])],
+        ideal: [{ action: 'give_word', person: 'tkach_t', text: 'Доброе утро! Тима, начнёшь?' }],
+      },
+    ],
+  },
+  {
+    id: 'rejected_handoff',
+    title: 'хост отклонил передачу слова отсутствующему: не повторять, дать слово тому, кто в can',
+    source: 'run3',
+    names: { guest_1: 'Зоя' },
+    state: round('tkach_t', ['guest_1'], ['tkach_t', 'guest_1']),
+    steps: [
+      {
+        events: [heard('tkach_t', 'сегодня разбираю воронку у меня всё'), { type: 'rejected', tool: 'give_word', reason: 'not_present', person: 'nevsky_g', can: ['guest_1'] }, silence(1000)],
+        expect: [[give('guest_1')]],
+        forbid: [give(['nevsky_g', 'orlov_y', 'belozersky_s'])],
+        ideal: [{ action: 'give_word', person: 'guest_1', text: '' }],
+      },
+    ],
+  },
+  {
+    id: 'finish_on_request',
+    title: 'посреди круга по имени просят закончить: попрощаться',
+    source: 'run3',
+    names: { guest_1: 'Зоя' },
+    state: round('tkach_t', ['guest_1'], ['tkach_t', 'guest_1']),
+    dialog: [{ who: 'tkach_t', text: 'ну мой план как обычно захватить мир' }],
+    steps: [
+      {
+        events: [heard('tkach_t', 'Кора заканчивай встречу')],
+        expect: [[leave()]],
+        ideal: [{ action: 'leave', text: 'Хорошо, заканчиваем. Всем хорошего дня!' }],
       },
     ],
   },

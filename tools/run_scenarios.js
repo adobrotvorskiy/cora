@@ -71,6 +71,7 @@ async function main() {
     rounds: Number(values.rounds),
     only,
     leadId: SCENARIO_LEAD,
+    names: Object.fromEntries(SCENARIO_ROSTER.map((p) => [p.id, p.vocative])),
     onStep: (sc, s) => {
       if (current !== sc.id) {
         current = sc.id;

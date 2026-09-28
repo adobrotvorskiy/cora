@@ -7,7 +7,7 @@ import { SCENARIOS, SCENARIO_LEAD, SCENARIO_ROSTER } from '../../src/agent/scena
 import { applyEvent, checkStep, runScenarios } from '../../src/agent/scenario_runner.js';
 import { violation } from '../../src/agent/invariants.js';
 import { sttLike } from '../../src/agent/scenarios.js';
-import { TOOLS, buildSystemPrompt, createDraftAgent, renderInput, toActions } from '../../src/agent/draft_agent.js';
+import { TOOLS, buildSystemPrompt, createDraftAgent, renderInput, toActions, toolsFor } from '../../src/agent/draft_agent.js';
 
 const ids = new Set(SCENARIO_ROSTER.map((p) => p.id));
 const byIndex = (sc, i) => sc.steps[i];
@@ -19,16 +19,17 @@ describe('scenarios: data', () => {
     assert.equal(new Set(SCENARIOS.map((s) => s.id)).size, SCENARIOS.length);
     assert.ok(SCENARIOS.length >= 15);
     for (const sc of SCENARIOS) {
-      for (const id of [...sc.state.present, ...(sc.state.queue ?? []), ...(sc.state.speaker ? [sc.state.speaker] : [])]) assert.ok(ids.has(id), `${sc.id}: ${id}`);
+      const known = (id) => ids.has(id) || Object.hasOwn(sc.names ?? {}, id); // guests are named in the scenario
+      for (const id of [...sc.state.present, ...(sc.state.queue ?? []), ...(sc.state.speaker ? [sc.state.speaker] : [])]) assert.ok(known(id), `${sc.id}: ${id}`);
       for (const step of sc.steps) {
         assert.ok(Array.isArray(step.expect) && step.expect.length, `${sc.id}: expect`);
         assert.ok(Array.isArray(step.ideal) && step.ideal.length, `${sc.id}: ideal`);
         for (const e of step.events) {
-          assert.ok(['heard', 'silence', 'joined', 'left', 'her_line_done', 'interrupted', 'chorus', 'state'].includes(e.type), `${sc.id}: ${e.type}`);
-          if (e.who && e.who !== '?' && !Array.isArray(e.who)) assert.ok(ids.has(e.who), `${sc.id}: ${e.who}`);
+          assert.ok(['heard', 'silence', 'joined', 'left', 'her_line_done', 'interrupted', 'chorus', 'rejected', 'state'].includes(e.type), `${sc.id}: ${e.type}`);
+          if (e.who && e.who !== '?' && !Array.isArray(e.who)) assert.ok(known(e.who), `${sc.id}: ${e.who}`);
         }
         for (const m of [...step.expect.flat(), ...(step.forbid ?? [])]) {
-          for (const p of [m.person].flat().filter(Boolean)) assert.ok(ids.has(p), `${sc.id}: matcher person ${p}`);
+          for (const p of [m.person].flat().filter(Boolean)) assert.ok(known(p), `${sc.id}: matcher person ${p}`);
         }
       }
     }
@@ -135,7 +136,7 @@ describe('scenario runner', () => {
 describe('draft agent', () => {
   test('prompt from the roster, input rendering, tool calls -> actions', () => {
     const prompt = buildSystemPrompt({ roster: SCENARIO_ROSTER, leadId: SCENARIO_LEAD });
-    assert.match(prompt, /orlov_y — Ярослав Орлов \(зовёшь «Слава»\), руководитель/);
+    assert.match(prompt, /руководителю \(lead в present\)/);
     assert.match(prompt, /Отвечай только вызовами инструментов/);
     assert.deepEqual(TOOLS.map((t) => t.function.name), ['say', 'give_word', 'ask_done', 'open_floor', 'skip', 'leave']);
     assert.match(prompt, /2,5 с без «у меня всё» — ask_done, если он уже говорил/);
@@ -169,6 +170,34 @@ describe('draft agent', () => {
     assert.ok(Number.isFinite(r.timings.first_tool_name));
     assert.equal(agent.toolChoice, 'auto');
     assert.deepEqual(bodies.map((b) => b.tool_choice), ['required', 'auto']);
-    assert.equal(bodies[1].tools.length, 6);
+    // waiting, one person: say / give_word (only to present ids) / skip / leave — no ask_done or open_floor before the round
+    assert.deepEqual(bodies[1].tools.map((t) => t.function.name), ['say', 'give_word', 'skip', 'leave']);
+    assert.deepEqual(bodies[1].tools[1].function.parameters.properties.person_id.enum, ['tkach_t']);
+  });
+
+  test('tools per phase; a server that refuses enum gets plain ids from then on', async () => {
+    assert.deepEqual(
+      toolsFor({ phase: 'round', speaker: 'tkach_t', present: ['tkach_t', 'nevsky_g'] }).map((t) => [t.function.name, t.function.parameters.properties.person_id?.enum ?? null]),
+      [['say', null], ['give_word', ['nevsky_g']], ['ask_done', ['tkach_t']], ['open_floor', null], ['skip', null], ['leave', null]],
+    );
+    assert.equal(TOOLS[1].function.parameters.properties.person_id.enum, undefined, 'the shared definitions stay untouched');
+    const bodies = [];
+    const fetch = async (url, init) => {
+      const body = JSON.parse(init.body);
+      bodies.push(body);
+      if (body.tools.some((t) => t.function.parameters.properties.person_id?.enum)) return new Response('{"error":{"message":"invalid tool parameters schema: enum"}}', { status: 400 });
+      return new Response(JSON.stringify({ choices: [{ message: { tool_calls: [{ id: 'a', type: 'function', function: { name: 'skip', arguments: '{}' } }] } }] }), { headers: { 'content-type': 'application/json' } });
+    };
+    const agent = createDraftAgent({ endpoint: 'http://mock', apiKey: 'k', model: 'm', system: 'S', fetch, stream: false });
+    await agent.decide({ phase: 'waiting', present: ['tkach_t'], events: [] });
+    await agent.decide({ phase: 'waiting', present: ['tkach_t'], events: [] });
+    assert.equal(bodies.length, 3, 'one refused request, then plain tools for good');
+  });
+
+  test('the input names the people in the room; the prompt has no roster', () => {
+    const input = JSON.parse(renderInput({ phase: 'waiting', present: ['orlov_y', 'guest_1'], names: { orlov_y: 'Слава', guest_1: 'Зоя' }, lead: 'orlov_y', events: [] }));
+    assert.deepEqual(input.present, [{ id: 'orlov_y', name: 'Слава', lead: true }, { id: 'guest_1', name: 'Зоя' }]);
+    const prompt = buildSystemPrompt({ roster: SCENARIO_ROSTER, leadId: SCENARIO_LEAD });
+    assert.doesNotMatch(prompt, /nevsky_g|Невский/);
   });
 });

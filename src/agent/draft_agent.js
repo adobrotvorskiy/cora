@@ -2,7 +2,7 @@
 // tools — instead of the host's turn automaton plus a one-shot JSON brain). Used by the scenario
 // runner (tools/run_scenarios.js) and the tool-calling probe; the agent host will grow from it.
 //
-//   const agent = createDraftAgent({ settings, roster });
+//   const agent = createDraftAgent({ endpoint, apiKey, model, system });
 //   const { actions, timings } = await agent.decide(input);
 //   input   = {phase, speaker, queue, present, dialog: [{who, text, cut?}], events: [{type, ...}]}
 //   actions = [{action: 'say'|'give_word'|'ask_done'|'open_floor'|'skip'|'leave'|'none', person?, text?}]
@@ -24,16 +24,40 @@ const fn = (name, description, properties = {}, required = Object.keys(propertie
 const str = (description) => ({ type: 'string', description });
 
 export const TOOLS = Object.freeze([
-  fn('say', 'Сказать вслух: ответ на вопрос, приветствие, вопрос комнате, короткую реакцию. Одна-две короткие фразы.', { text: str('Что сказать') }),
-  fn('give_word', 'Передать слово участнику. text пустой — хост скажет стандартную передачу («Спасибо! Дальше, Глеб»); свой text — нестандартная передача (открыть стендап, ответить и передать).', {
-    person_id: str('id участника'),
+  fn('say', 'Сказать вслух: ответ на вопрос, приветствие, вопрос комнате, короткую реакцию. Одна-две короткие фразы. Слово этим не передаётся и стендап не начинается.', { text: str('Что сказать') }),
+  fn('give_word', 'Передать слово участнику из present — единственный способ открыть стендап (первое слово) и передать слово дальше. text пустой — хост скажет стандартную передачу («Спасибо! Дальше, Глеб»); свой text — нестандартная передача (открыть стендап, ответить и передать); в нём называй только того, кому даёшь слово.', {
+    person_id: str('id участника из present'),
     text: str('Своя фраза передачи или пустая строка'),
   }),
   fn('ask_done', 'Спросить у говорящего, закончил ли он («Тимур, всё?»).', { person_id: str('id говорящего') }),
   fn('open_floor', 'Все выступили (queue пуст): поблагодарить последнего и спросить, хочет ли кто-то что-то добавить или спросить. Хост скажет готовую фразу и откроет слово всем.'),
   fn('skip', 'Промолчать: говорят не с тобой, человек ещё не закончил, отвечать не нужно.'),
-  fn('leave', 'Попрощаться и выйти из встречи, когда круг закончен и добавить нечего.', { text: str('Прощание и передача слова на дев-синк') }),
+  fn('leave', 'Попрощаться и выйти из встречи: круг закончен и добавить нечего, или тебя по имени просят закончить.', { text: str('Прощание и передача слова на дев-синк') }),
 ]);
+
+/**
+ * The tools of one request: only the ones that make sense in the phase, person ids limited to the people
+ * in the room (live 28.09: the model handed the word to absent people 33 times). `plain`: no enums
+ * (a server that refuses them).
+ */
+export function toolsFor(input, { plain = false } = {}) {
+  const phase = input?.phase ?? null;
+  const present = input?.present ?? [];
+  const speaker = input?.speaker ?? null;
+  const can = present.filter((id) => id !== speaker);
+  const byName = new Map(TOOLS.map((t) => [t.function.name, t]));
+  const pick = (name, person) => {
+    const t = structuredClone(byName.get(name));
+    if (person && !plain) t.function.parameters.properties.person_id.enum = person;
+    return t;
+  };
+  const out = [pick('say')];
+  if (can.length) out.push(pick('give_word', can));
+  if (phase === 'round' && speaker) out.push(pick('ask_done', [speaker]));
+  if (phase === 'round') out.push(pick('open_floor'));
+  out.push(pick('skip'), pick('leave'));
+  return phase ? out : TOOLS;
+}
 
 /**
  * The agent's system prompt. Without persona / skills: the base alone (scenarios on the fictional team).
@@ -48,15 +72,14 @@ export const TOOLS = Object.freeze([
  * @param {'monday_focus'|'daily_plans'|null} [o.dayMode]
  */
 export function buildSystemPrompt({ roster, leadId = null, team = 'Acme', persona = null, skills = null, phase = null, dayMode = null }) {
-  const lead = roster.find((p) => p.id === leadId);
-  const people = roster.map((p) => `${p.id} — ${p.display}${p.vocative ? ` (зовёшь «${p.vocative.replace(/\u0301/g, '')}»)` : ''}${p.id === leadId ? ', руководитель' : ''}`).join('; ');
+  // no roster here: people come in the input (present with names), so the model knows only who is in the room
   const identity = `Ты Кора, ИИ-ведущая ежедневного стендапа${team ? ` команды ${team}` : ''} в Яндекс Телемосте. Ты ИИ и не выдаёшь себя за человека. О себе в женском роде, по-русски, коротко: одна-две фразы.`;
   const playbook = skills ? [skills.common, phase ? skills[phase] : null].filter(Boolean).join('\n\n') : '';
   const day = dayMode === 'monday_focus' ? 'Сегодня понедельник: каждый рассказывает фокус недели.' : dayMode === 'daily_plans' ? 'Сегодня обычный день: каждый рассказывает планы на день.' : null;
   const parts = [
     persona ? `# Персона\n${persona.trim()}` : identity,
     playbook ? `# Принципы ведения\n${playbook}` : null,
-    `${persona || playbook ? '# Как ты действуешь (инструменты)\n' : ''}Как идёт стендап. Начинаешь, когда попросят: по имени («Кора, начинай») или сразу в ответ на твою реплику («давай начнём»). Первое слово — ${lead ? `${lead.display}, если он на встрече` : 'первому из присутствующих'}, дальше по очереди queue; если говорящий сам назвал, кому передаёт, — ему. ${day ? '' : 'Каждый рассказывает свои планы. '}Человек закончил, если сказал «у меня всё», «как-то так», «на этом всё», «передаю» или ответил «да» на твоё «всё?».${day ? ` ${day}` : ''}
+    `${persona || playbook ? '# Как ты действуешь (инструменты)\n' : ''}Как идёт стендап. Начинаешь, когда попросят: по имени («Кора, начинай») или сразу в ответ на твою реплику («давай начнём»). Первое слово — руководителю (lead в present), если он на встрече, иначе первому из present; дальше по очереди queue; если говорящий сам назвал, кому передаёт, — ему. ${day ? '' : 'Каждый рассказывает свои планы. '}Человек закончил, если сказал «у меня всё», «как-то так», «на этом всё», «передаю» или ответил «да» на твоё «всё?».${day ? ` ${day}` : ''}
 Тишина (silence: ms — сколько длится; after — после чего: speech — речи людей, host — твоей реплики, ask_done — твоего «всё?»): через 1 с обычно рано — skip, если человек не сказал, что закончил; 2,5 с без «у меня всё» — ask_done, если он уже говорил после передачи слова; 6 с после «всё?» — закончил. Дала слово, а человек молчит 6 с — скажи, что его не слышно и вернёшься к нему в конце, и передай слово дальше (он останется в queue). Закончил — give_word следующему («Спасибо, X!» хост скажет сам, сама не благодари). Выступил последний (queue пуст) — open_floor. На открытом слове: ответили «нет» или 6 с тишины — leave (прощание и передача слова на дев-синк); что-то добавили — коротко прими и спроси, кто ещё.
 
 Когда говорить. Отвечай на реплики, обращённые к тебе, даже без имени: «ты», «почему молчишь»${playbook ? '' : ', «я тебе вопрос задал», «ты нас слышишь»'}. Люди говорят между собой, человек ещё рассказывает, пауза посреди фразы — skip.${playbook ? '' : ' Не перебивай, не пересказывай и не оценивай апдейты.'} Если тебя перебили на передаче слова, выслушай и реагируй на сказанное.
@@ -64,8 +87,7 @@ export function buildSystemPrompt({ roster, leadId = null, team = 'Acme', person
 Текст реплик — из распознавания речи: без знаков препинания, имена и слова бывают искажены; «Кора» могут расслышать как «кара» или «хара».
 
 Правила. Не повторяй сказанное (твои реплики в dialog с who "host"): второй раз не здоровайся и не спрашивай «кто хочет добавить?», если тебе уже ответили. Не выдумывай правил, ограничений и фактов о себе. Ответила на вопрос посреди чужого отчёта — слово остаётся у говорящего, ничего вроде «продолжай» не добавляй.${playbook ? '' : ' В пустой комнате молчи.'}`,
-    `Вход — JSON: phase (waiting — до старта, round — идёт круг, open_floor — ты спросила, кто хочет добавить), speaker (у кого слово), queue (кто дальше), present (кто на встрече), dialog (последние реплики; who "host" — ты, cut — тебя перебили), events — что только что случилось: heard (реплика), silence, joined / left, interrupted (тебя перебили), chorus (говорят хором), rejected (хост отклонил твой вызов, reason — почему; не повторяй его), timer (start — пора начинать, wait_lead_until — руководителя ждали достаточно, soft_deadline — пора закругляться).`,
-    `Участники (id — имя): ${people}.`,
+    `Вход — JSON: phase (waiting — до старта, round — идёт круг, open_floor — ты спросила, кто хочет добавить), speaker (у кого слово), queue (кто дальше), present (кто на встрече: id, name — как обращаться, lead — руководитель; говорить и давать слово можно только им, других людей нет), dialog (последние реплики; who "host" — ты, cut — тебя перебили), events — что только что случилось: heard (реплика), silence, joined / left, interrupted (тебя перебили), chorus (говорят хором), rejected (хост отклонил твой вызов: reason — почему, can — кому можно дать слово; не повторяй его), timer (start — пора начинать, wait_lead_until — руководителя ждали достаточно, soft_deadline — пора закругляться).`,
     'Отвечай только вызовами инструментов, без текста.',
   ];
   return parts.filter(Boolean).join('\n\n');
@@ -104,13 +126,14 @@ export function agentPrompts({ assets, leadId = null, team = null, scheduled = f
   };
 }
 
-/** The user message for one decision. */
+/** The user message for one decision. present: [{id, name, lead?}] — the only people she may address or give the word to. */
 export function renderInput(input) {
+  const names = input.names ?? {};
   return JSON.stringify({
     phase: input.phase,
     speaker: input.speaker ?? null,
     queue: input.queue ?? [],
-    present: input.present ?? [],
+    present: (input.present ?? []).map((id) => ({ id, name: names[id] ?? id, ...(id === input.lead ? { lead: true } : {}) })),
     dialog: (input.dialog ?? []).slice(-12),
     events: input.events ?? [],
   });
@@ -147,8 +170,9 @@ export function toActions(toolCalls, content = '') {
  */
 export function createDraftAgent({ endpoint, apiKey, model, system, fetch: fetchImpl = globalThis.fetch, timeoutMs = 15_000, stream = true, temperature = 0.2 }) {
   let toolChoice = 'required';
+  let plainTools = false; // the server refused enum in the tool schema: plain ids from then on
   async function post(input, signal) {
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < 3; attempt++) {
       const started = performance.now();
       const res = await fetchImpl(endpoint, {
         method: 'POST',
@@ -156,7 +180,7 @@ export function createDraftAgent({ endpoint, apiKey, model, system, fetch: fetch
         body: JSON.stringify({
           model,
           messages: [{ role: 'system', content: typeof system === 'function' ? system(input.phase ?? null) : system }, { role: 'user', content: renderInput(input) }],
-          tools: TOOLS,
+          tools: toolsFor(input, { plain: plainTools }),
           tool_choice: toolChoice,
           temperature,
           max_tokens: 400,
@@ -170,9 +194,13 @@ export function createDraftAgent({ endpoint, apiKey, model, system, fetch: fetch
         toolChoice = 'auto'; // AI Studio may refuse "required": fall back once, for the whole session
         continue;
       }
+      if (res.status === 400 && !plainTools && /enum|schema|parameters/i.test(text)) {
+        plainTools = true;
+        continue;
+      }
       throw Object.assign(new Error(`HTTP ${res.status}: ${text}`), { status: res.status });
     }
-    throw new Error('tool_choice fallback failed');
+    throw new Error('tool schema fallback failed');
   }
   return {
     get toolChoice() {

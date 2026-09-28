@@ -32,13 +32,15 @@ export function applyEvent(sit, e) {
   }
 }
 
-/** The agent's input after a step's events. */
-export function inputOf(sit, events) {
+/** The agent's input after a step's events (names: id -> short name, as the host gives them). */
+export function inputOf(sit, events, { names = null, leadId = null } = {}) {
   return {
     phase: sit.phase,
     speaker: sit.speaker ?? null,
     queue: [...(sit.queue ?? [])],
     present: [...sit.present],
+    ...(names ? { names: Object.fromEntries(sit.present.map((id) => [id, names[id] ?? id])) } : {}),
+    ...(leadId && sit.present.includes(leadId) ? { lead: leadId } : {}),
     dialog: sit.dialog.map((l) => ({ ...l })),
     events: events.filter((e) => e.type !== 'state').map((e) => ({ ...e })),
   };
@@ -55,6 +57,7 @@ export function matches(action, m) {
   return true;
 }
 
+import { mentionsHost } from '../core/guards.js';
 import { violation } from './invariants.js';
 
 /** Actions that count as saying nothing. */
@@ -70,9 +73,10 @@ const quiet = (actions) => actions.every((a) => a.action === 'skip');
  */
 export function checkStep(step, actions, sit = null, { leadId = null } = {}) {
   const acts = (actions ?? []).filter((a) => a && a.action);
+  const askedByName = (step.events ?? []).some((e) => e.type === 'heard' && mentionsHost(e.text));
   if (sit) {
     for (const a of acts) {
-      const why = violation(a, sit, { leadId });
+      const why = violation(a, sit, { leadId, askedByName });
       if (why) return { ok: false, kind: 'violation', why: `invariant ${why}: ${describe(a)}` };
     }
   }
@@ -100,7 +104,7 @@ export function checkStep(step, actions, sit = null, { leadId = null } = {}) {
  * @param {(input: object) => Promise<{actions: object[], timings?: object}>} decide
  * @param {{rounds?: number, only?: string[], onStep?: Function, now?: () => number}} [opts]
  */
-export async function runScenarios(scenarios, decide, { rounds = 1, only = null, onStep = null, leadId = null, now = () => performance.now() } = {}) {
+export async function runScenarios(scenarios, decide, { rounds = 1, only = null, onStep = null, leadId = null, names = null, now = () => performance.now() } = {}) {
   const results = [];
   for (let r = 0; r < rounds; r++) {
     for (const sc of scenarios) {
@@ -115,7 +119,7 @@ export async function runScenarios(scenarios, decide, { rounds = 1, only = null,
       const steps = [];
       for (const [i, step] of sc.steps.entries()) {
         for (const e of step.events) applyEvent(sit, e);
-        const input = inputOf(sit, step.events);
+        const input = inputOf(sit, step.events, { names: { ...(names ?? {}), ...(sc.names ?? {}) }, leadId });
         const t0 = now();
         let actions = [];
         let timings = null;

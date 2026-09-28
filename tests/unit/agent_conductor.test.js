@@ -35,11 +35,12 @@ function manualAgent() {
   };
 }
 
-function makeWorld({ present, phase = 'waiting', speaker = null, queue = [], agent = manualAgent(), budget, dialog } = {}) {
+function makeWorld({ present, phase = 'waiting', speaker = null, queue = [], agent = manualAgent(), budget, dialog, names = {} } = {}) {
   const clock = { t: 1_000_000 };
   const now = () => clock.t;
   const state = createState({ roster: ROSTER, now });
-  state.applyParticipants(present.map((id) => ({ name: DISPLAY[id] })), { t: now() });
+  const nameOf = (id) => DISPLAY[id] ?? names[id] ?? id; // guests: their Telemost name (guest_1 is the first unknown one)
+  state.applyParticipants(present.map((id) => ({ name: nameOf(id) })), { t: now() });
   if (phase !== 'waiting') {
     state.setPhase(phase);
     for (const id of present) if (id !== speaker && !queue.includes(id)) state.setStatus(id, 'spoke');
@@ -126,7 +127,7 @@ function makeWorld({ present, phase = 'waiting', speaker = null, queue = [], age
     },
     setPresent(ids) {
       const before = new Set(state.presentIds());
-      const diff = state.applyParticipants(ids.map((id) => ({ name: DISPLAY[id] })), { t: clock.t });
+      const diff = state.applyParticipants(ids.map((id) => ({ name: nameOf(id) })), { t: clock.t });
       for (const id of diff.joined) c.joined(id);
       for (const id of diff.left) c.left(id);
       return { before, diff };
@@ -389,7 +390,7 @@ describe('conductor: the executor', () => {
     assert.deepEqual(w.find('agent.rejected').map((e) => e.reason), ['not_present']);
     await w.wait(100);
     const next = w.agent.open()[0];
-    assert.deepEqual(next.input.events, [{ type: 'rejected', tool: 'give_word', reason: 'not_present' }]);
+    assert.deepEqual(next.input.events, [{ type: 'rejected', tool: 'give_word', reason: 'not_present', person: 'orlov_y', can: ['nevsky_g'] }], 'who can get the word instead');
     next.answer([{ action: 'ask_done', person: 'nevsky_g' }]);
     await w.wait(300);
     assert.equal(w.agent.open().length, 0, 'only one extra wake until a call is accepted');
@@ -589,6 +590,79 @@ describe('conductor: after the review of 27.09', () => {
   });
 });
 
+describe('conductor: after the live test of 28.09', () => {
+  test('the input carries the people in the room with their names and the lead', async () => {
+    const w = makeWorld({ present: ['orlov_y', 'guest_1'], names: { guest_1: 'Зоя Тестова' } });
+    w.heard('guest_1', 'Кора привет');
+    await flush();
+    const inp = w.agent.calls[0].input;
+    assert.deepEqual(inp.present, ['orlov_y', 'guest_1']);
+    assert.equal(inp.names.guest_1, 'Зоя');
+    assert.equal(inp.lead, 'orlov_y');
+    assert.ok(inp.names.orlov_y && !/\u0301/.test(inp.names.orlov_y));
+  });
+
+  test('the same refused call twice: agent.stuck, no silence wakes until someone speaks', async () => {
+    const w = makeWorld({ present: ['tkach_t', 'guest_1'], phase: 'round', speaker: 'tkach_t', queue: ['guest_1'], names: { guest_1: 'Зоя' } });
+    w.heard('tkach_t', 'у меня всё');
+    await flush();
+    w.agent.calls[0].answer([{ action: 'give_word', person: 'nevsky_g', text: '' }]);
+    await w.wait(200);
+    const again = w.agent.open()[0];
+    assert.deepEqual(again.input.events.at(-1), { type: 'rejected', tool: 'give_word', reason: 'not_present', person: 'nevsky_g', can: ['guest_1'] });
+    again.answer([{ action: 'give_word', person: 'nevsky_g', text: '' }]);
+    await flush();
+    assert.equal(w.find('agent.stuck').length, 1);
+    const n = w.agent.calls.length;
+    await w.wait(20_000);
+    assert.equal(w.agent.calls.length, n, 'no silence wakes while stuck');
+    w.heard('tkach_t', 'Кора дальше давай');
+    await flush();
+    assert.equal(w.agent.calls.length, n + 1, 'speech wakes her again');
+  });
+
+  test('«Кора, заканчивай» in the round: leave is allowed; without her name it is not', async () => {
+    const w = makeWorld({ present: ['tkach_t', 'guest_1'], phase: 'round', speaker: 'tkach_t', queue: ['guest_1'], names: { guest_1: 'Зоя' } });
+    w.heard('tkach_t', 'Кора заканчивай встречу');
+    await flush();
+    w.agent.calls[0].answer([{ action: 'leave', text: 'Хорошо, заканчиваем. Всем хорошего дня!' }]);
+    await flush();
+    assert.deepEqual(w.calls.map((c) => c.tool), ['leave']);
+    const o = makeWorld({ present: ['tkach_t', 'guest_1'], phase: 'round', speaker: 'tkach_t', queue: ['guest_1'], names: { guest_1: 'Зоя' } });
+    o.heard('tkach_t', 'походу нам надо уходить');
+    await flush();
+    o.agent.calls[0].answer([{ action: 'leave', text: 'Пока!' }]);
+    await flush();
+    assert.deepEqual(o.find('agent.rejected').map((e) => e.reason), ['round_not_finished']);
+  });
+
+  test('a handoff text naming someone else is refused (give_word(Тима, «…Дальше, Глеб.»))', async () => {
+    const w = makeWorld({ present: ['tkach_t', 'nevsky_g', 'belozersky_s'] });
+    w.heard('belozersky_s', 'Кора начинай');
+    await flush();
+    w.agent.calls[0].answer([{ action: 'give_word', person: 'tkach_t', text: 'Поняла, спасибо. Дальше, Глеб.' }]);
+    await flush();
+    assert.deepEqual(w.find('agent.rejected').map((e) => e.reason), ['text_names_someone_else']);
+  });
+
+  test('a line mostly repeating her recent one is refused; a small group chit-chat line is not «addressed»', async () => {
+    const w = makeWorld({ present: ['tkach_t', 'guest_1'], names: { guest_1: 'Зоя' } });
+    w.her('Тима, когда будешь готов — скажи, начну стендап.', { kind: 'agent_say' });
+    w.clock.t += 9000;
+    w.heard('tkach_t', 'Кора ты тут');
+    await flush();
+    w.agent.calls[0].answer([{ action: 'say', text: 'Отлично, Тима, когда будешь готов — скажи, начну стендап.' }]);
+    await flush();
+    assert.deepEqual(w.find('agent.rejected').map((e) => e.reason), ['repeat']);
+    const c = makeWorld({ present: ['tkach_t', 'guest_1'], names: { guest_1: 'Зоя' } });
+    c.heard('guest_1', 'да ну вот с полов три молодец уже хорошо'); // between the two of them
+    await flush();
+    c.agent.calls[0].answer([{ action: 'say', text: 'Здорово!' }]);
+    await flush();
+    assert.equal(c.calls.at(-1).how, null, 'not addressed to her');
+  });
+});
+
 // --------------------------------------------------------------------------- scenarios, host path
 
 const isAskDone = (text) => /всё\?\s*$/i.test(text);
@@ -596,7 +670,7 @@ const isAskDone = (text) => /всё\?\s*$/i.test(text);
 describe('conductor: every scenario through the host path with its ideal decisions', () => {
   for (const sc of SCENARIOS) {
     test(`${sc.id}: woken where a decision is due, the ideal decision accepted`, async () => {
-      const w = makeWorld({ present: sc.state.present, phase: sc.state.phase, speaker: sc.state.speaker, queue: sc.state.queue ?? [], dialog: sc.dialog });
+      const w = makeWorld({ present: sc.state.present, phase: sc.state.phase, speaker: sc.state.speaker, queue: sc.state.queue ?? [], dialog: sc.dialog, names: sc.names });
       for (const [i, step] of sc.steps.entries()) {
         const before = { rejected: w.find('agent.rejected').length, calls: w.calls.length };
         for (const e of step.events) {

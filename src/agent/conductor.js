@@ -85,6 +85,8 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
   let preempts = 0;
   let rewake = null; // reason of a wake owed once nothing is in flight
   let rejectWakes = 0;
+  let lastRejectKey = null;
+  let stuck = false; // the same call refused twice in a row: no silence wakes until someone speaks (live 28.09: 25 identical refusals)
   let lastHumanAt = -Infinity;
   let lastHerEndAt = -Infinity;
   let lastHerKind = null;
@@ -110,8 +112,22 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
     return { phase: ph, speaker: ph === 'round' ? state.current : null, queue: ph === 'waiting' ? [] : queue(), present: state.presentIds() };
   }
 
+  /** Short names of the people she may address: present ones only (live 28.09: with the whole roster in the prompt the model called absent people). */
+  function names(ids) {
+    const out = {};
+    for (const id of ids) out[id] = String(state.vocative?.(id) ?? id).replace(/\u0301/g, '');
+    return out;
+  }
+
   function input() {
-    return { ...situation(), dialog: dialog.slice(-12).map(({ who, text, cut }) => ({ who, text, ...(cut ? { cut: true } : {}) })), events: pending.map((p) => p.e) };
+    const sit = situation();
+    return {
+      ...sit,
+      names: names(sit.present),
+      ...(leadId && sit.present.includes(leadId) ? { lead: leadId } : {}),
+      dialog: dialog.slice(-12).map(({ who, text, cut }) => ({ who, text, ...(cut ? { cut: true } : {}) })),
+      events: pending.map((p) => p.e),
+    };
   }
 
   function push(e, how = null) {
@@ -159,6 +175,7 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
       askedDoneFor = null;
       spokeIn = state.current;
     }
+    stuck = false;
     if (letters(s) < 2) return; // «а», «м»: in the dialog, not worth a wake
     bump('heard');
     wake('heard');
@@ -186,12 +203,14 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
 
   function joined(id) {
     push({ type: 'joined', who: id });
+    stuck = false;
     ladder.fired = 0; // stages that already passed fire once more, with the newcomer in the input
     ladder.repeats = 0;
   }
 
   function left(id) {
     push({ type: 'left', who: id });
+    stuck = false;
     if (askedDoneFor === id) askedDoneFor = null;
     bump('left'); // a handoff to someone who just left must not play
     ladder.fired = 0;
@@ -216,7 +235,7 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
       resetLadder(t);
       return;
     }
-    if (inflight) return;
+    if (inflight || stuck) return;
     if (rewake && pending.length) {
       const why = rewake;
       rewake = null;
@@ -335,20 +354,49 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
 
   // ----------------------------------------------------------------------------------- executor
 
-  function reject(a, why) {
+  /** What the agent may do instead: who can get the word, who is the speaker. */
+  function hintFor(a, why, sit) {
+    if (a.action === 'give_word') {
+      const can = sit.present.filter((id) => id !== sit.speaker && state.get(id)?.status !== 'spoke' && (why !== 'lead_goes_first' || id === leadId));
+      return { can };
+    }
+    if (a.action === 'ask_done') return sit.speaker ? { speaker: sit.speaker } : { hint: 'круг не начат: сначала give_word' };
+    if (a.action === 'leave' || a.action === 'open_floor') return sit.queue.length ? { queue: sit.queue } : {};
+    return {};
+  }
+
+  function reject(a, why, sit = situation()) {
     stats.rejected++;
     ev('agent.rejected', { tool: a.action, reason: why, ...(a.person ? { person: a.person } : {}), ...(a.text ? { text: a.text } : {}) });
-    push({ type: 'rejected', tool: a.action === 'unknown' ? a.name : a.action, reason: why });
+    push({ type: 'rejected', tool: a.action === 'unknown' ? a.name : a.action, reason: why, ...(a.person ? { person: a.person } : {}), ...hintFor(a, why, sit) });
+    const key = `${a.action}:${a.person ?? ''}:${why}`;
+    if (key === lastRejectKey && !stuck) {
+      stuck = true;
+      ev('agent.stuck', { tool: a.action, reason: why, ...(a.person ? { person: a.person } : {}) });
+    }
+    lastRejectKey = key;
     // a refused turn action must not leave the round stuck in silence: one more wake, then the ladder
-    if (TURN_TOOLS.has(a.action) && rejectWakes < 1) {
+    if (TURN_TOOLS.has(a.action) && rejectWakes < 1 && !stuck) {
       rejectWakes++;
       rewake ??= 'rejected';
     }
   }
 
+  /** Said to the end within SAY_REPEAT_MS, or most of its words were (live 28.09: «…когда будешь готов — скажи, начну» three times). */
   function saidLately(text, t) {
-    const x = fold(text);
-    return dialog.some((l) => l.who === 'host' && !l.cut && t - l.t <= SAY_REPEAT_MS && (fold(l.text) === x || (x.length >= 24 && fold(l.text).startsWith(x))));
+    const words = fold(text).split(' ').filter((w) => w.length >= 3);
+    return dialog.some((l) => {
+      if (l.who !== 'host' || l.cut || t - l.t > SAY_REPEAT_MS) return false;
+      const bag = new Set(fold(l.text).split(' '));
+      return words.length > 0 && words.filter((w) => bag.has(w)).length / words.length >= 0.7;
+    });
+  }
+
+  /** A handoff text that names someone other than the one getting the word (live 28.09: give_word(Тима, «…Дальше, Глеб.»)). */
+  function namesSomeoneElse(text, sit, person) {
+    const ids = new Set([...sit.present, ...(state.people ?? []).map((p) => p.id)]);
+    for (const id of ids) if (id !== person && id !== sit.speaker && id !== state.current && namesPerson(text, id)) return true;
+    return false;
   }
 
   /** The host's own checks on top of invariants.violation(). */
@@ -365,6 +413,7 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
         return null;
       case 'give_word':
         if (state.get(a.person)?.status === 'spoke') return 'already_spoke';
+        if (a.text && namesSomeoneElse(a.text, sit, a.person)) return 'text_names_someone_else';
         return null;
       case 'ask_done':
         if (spokeIn !== a.person) return 'not_started'; // «Глеб, всё?» to someone who has not said a word yet
@@ -400,16 +449,19 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
       }
       // «начнём с Глеба» from the lead himself: the lead-first rule gives way
       const leadAsked = a.action === 'give_word' && sit.phase === 'waiting' && used.some((p) => p.e.type === 'heard' && p.e.who === leadId && namesPerson(p.e.text, a.person));
-      const why = violation(a, sit, { leadId: leadAsked ? null : leadId }) ?? hostCheck(a, sit, ctx);
+      const why = violation(a, sit, { leadId: leadAsked ? null : leadId, askedByName: ctx.how === 'name' }) ?? hostCheck(a, sit, ctx);
       if (why) {
-        reject(a, why);
+        reject(a, why, sit);
         continue;
       }
       const r = run(a, sit, ctx) ?? { ok: true };
-      if (!r.ok) reject(a, r.reason ?? 'refused');
+      if (!r.ok) reject(a, r.reason ?? 'refused', sit);
       else accepted++;
     }
-    if (accepted) rejectWakes = 0;
+    if (accepted) {
+      rejectWakes = 0;
+      lastRejectKey = null;
+    }
   }
 
   /** Does a line name this person (short name or first name, any ending)? */

@@ -443,7 +443,7 @@ export function createFloor({ settings = {}, log = null, now = Date.now } = {}) 
       return;
     }
     if (turn.fired) return;
-    // live 27.09: «Лёша, у тебя всё?» the moment her answer ended — the silence counted her own speech
+    // live 27.09: «Тима, у тебя всё?» the moment her answer ended — the silence counted her own speech
     if (!vadOpen && sil >= cfg.check_done_ms && at - hostEndedAt >= cfg.check_done_ms) return fire('silence_2500', at);
     return undefined;
   }
