@@ -950,6 +950,16 @@ describe('conductor: after the code review of 28.09', () => {
     assert.deepEqual(t.find('agent.rejected').map((e) => e.reason), ['text_names_someone_else']);
   });
 
+  test('a handoff text thanking the last speaker and naming the one getting the word passes (live 29.09)', async () => {
+    const w = makeWorld({ present: ['tkach_t', 'nevsky_g', 'orlov_y'], phase: 'round', speaker: 'tkach_t', queue: ['nevsky_g'] });
+    w.heard('tkach_t', 'правда больше ничего нет');
+    await flush();
+    w.agent.calls[0].answer([{ action: 'give_word', person: 'nevsky_g', text: 'Поняла, спасибо, Ярослав. Глеб, передаю тебе слово!' }]);
+    await flush();
+    assert.equal(w.find('agent.rejected').length, 0);
+    assert.equal(w.calls.at(-1).tool, 'giveWord');
+  });
+
   test('not_addressed: not before the round, not for a say next to a handoff', async () => {
     const w = makeWorld({ present: ['tkach_t', 'nevsky_g', 'orlov_y'] });
     w.heard('tkach_t', 'а кого мы ждём');

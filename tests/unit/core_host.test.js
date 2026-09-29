@@ -1302,6 +1302,61 @@ describe('host: agent mode after the code review of 28.09', () => {
     await h.finish();
   });
 
+  test('live 29.09: the first speaker starts his update before the opening line could play — his turn begins without it', async () => {
+    const agent = scriptAgent((input) => (input.phase === 'waiting' && /давай/.test(lastHeard(input)) ? [{ action: 'give_word', person: 'tkach_t', text: 'Поехали! Тима, начнёшь?' }] : [{ action: 'skip' }]));
+    const h = makeHost({ present: ['Тимур Ткач', 'Глеб Невский'], onDemand: true, agent });
+    await h.ready();
+    final(h, 's1', 'ну давай');
+    await h.advance(600, LOUD); // he goes on at once: the opening line waits at the floor gate
+    assert.equal(h.find('round.start').length, 1);
+    h.lit(['Тимур Ткач']);
+    await h.advance(1200, LOUD);
+    final(h, 's2', 'я сегодня почти всё сделал что планировал');
+    await h.advance(200, LOUD);
+    h.lit([]);
+    await h.advance(1500, QUIET);
+    assert.deepEqual(h.find('round.start_silent').map((e) => e.first), ['tkach_t']);
+    assert.equal(h.find('round.start_dropped').length, 0);
+    assert.equal(h.host.phase, 'round');
+    assert.equal(h.host.state.current, 'tkach_t');
+    assert.ok(!h.player.plays.some((p) => p.meta.kind === 'start'), 'no opening line over his update');
+    await h.finish();
+  });
+
+  test('the next speaker talks over «Дальше, Глеб» or before it: his turn, not a revert to the last speaker (review P2)', async () => {
+    const agent = scriptAgent(startThen((input, text) => (/у меня всё/.test(text) && input.speaker === 'tkach_t' ? [{ action: 'give_word', person: 'nevsky_g', text: '' }] : [{ action: 'skip' }])));
+    const h = makeHost({ present: ['Тимур Ткач', 'Глеб Невский'], onDemand: true, agent });
+    await h.ready();
+    final(h, 'p1', 'Кора, начинай');
+    await h.advance(1500, QUIET);
+    final(h, 'p2', 'сегодня тесты у меня всё');
+    await h.advance(700, QUIET); // «Спасибо, Тима!»
+    h.lit(['Глеб Невский']);
+    await h.advance(1200, LOUD); // Gleb starts right away: the handoff waits at the gate
+    final(h, 'p3', 'так я сегодня делаю ревью');
+    await h.advance(200, LOUD);
+    h.lit([]);
+    await h.advance(1500, QUIET);
+    assert.deepEqual(h.find('turn.handoff_silent').map((e) => e.to), ['nevsky_g']);
+    assert.equal(h.find('turn.end_reverted').length, 0);
+    assert.equal(h.host.state.current, 'nevsky_g');
+    assert.equal(h.host.state.get('tkach_t').status, 'spoke');
+    await h.finish();
+  });
+
+  test('live 29.09: «до свидания» while her farewell waits does not cancel it', async () => {
+    const agent = scriptAgent((input) => (input.phase === 'waiting' && /заканчивай/.test(lastHeard(input)) ? [{ action: 'leave', text: 'Всем хорошего дня!' }] : [{ action: 'skip' }]));
+    const h = makeHost({ present: ['Тимур Ткач', 'Глеб Невский'], onDemand: true, agent });
+    await h.ready();
+    final(h, 'c1', 'Кора, заканчивай');
+    await h.advance(600, LOUD);
+    final(h, 'c2', 'до свидания');
+    await h.advance(1500, QUIET);
+    assert.equal(h.find('round.closing_reverted').length, 0);
+    assert.equal(h.player.plays.at(-1)?.meta.text, 'Всем хорошего дня!');
+    assert.equal(await h.run, 0);
+  });
+
   test('an answer by name decided twice (a newer line re-woke her while it waited) plays once', async () => {
     const agent = scriptAgent((input) => {
       const asked = input.dialog.some((l) => /Кора, ты тут/.test(l.text));

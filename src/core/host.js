@@ -684,7 +684,8 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     let n = 0;
     // an answer to her name (or the opening line asked by name) plays within forceAfterMs whatever follows:
     // dropping it would lose the answer (review 27.09, 28.09)
-    const asked = (spec) => spec.forceAfterMs && (spec.kind === 'agent_say' || spec.kind === 'start');
+    // the farewell too: «до свидания» in reply must not cancel her leaving (live 29.09: closing dropped, said twice)
+    const asked = (spec) => spec.kind === 'closing' || (spec.forceAfterMs && (spec.kind === 'agent_say' || spec.kind === 'start'));
     const to = (spec) => !person || spec.person === person || spec.meta?.to === person;
     const hit = (spec) => spec && spec.agentEpoch != null && spec.agentEpoch < epoch && !spec.superseded && !asked(spec) && to(spec);
     for (const item of speechQueue) {
@@ -1028,12 +1029,22 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     state.setPhase('round');
     bump();
     ev('round.start', { first: id, key, day_mode: dayMode, lead_present: state.leadPresent() });
+    const decidedAt = wall();
     const asked = cascade && flow.startRequestedAt !== null; // «Кора, начинай»: people are waiting for her
     say({ key: text ? null : key, text, person: id, kind: 'start', maxWaitMs: 15_000, ...(asked ? { forceAfterMs: ADDRESSED_FORCE_MS } : {}) }, (r) => {
       flow.startPending = false;
       // agent mode: people spoke again before the opening line played, or the first speaker left while it
       // played (review 28.09: a turn given to someone absent) — the agent decides anew
       const gone = agentMode && !state.get(id)?.present;
+      if (agentMode && dropped(r) && !gone && spokeSince(id, decidedAt)) {
+        // he began his update on his own before the opening line could play (live 29.09: the line was dropped,
+        // the round never started, and he was asked to start again after he had finished): his turn, no line
+        ev('round.start_silent', { first: id });
+        beginTurn(id);
+        conductor?.speakerStarted?.(id);
+        if (!flow.greetedAt) flow.greetedAt = nowMs();
+        return;
+      }
       if (dropped(r) || gone) {
         flow.roundStarted = false;
         state.setPhase('waiting');
@@ -1046,6 +1057,27 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
       beginTurn(id);
       if (!flow.greetedAt) flow.greetedAt = nowMs();
     });
+  }
+
+  /** Has this person said something (a final line) since wall time `t`? */
+  function spokeSince(id, t) {
+    return transcript.lines.some((l) => l.who === id && l.t >= t);
+  }
+
+  /** The one she was giving the word to is talking already (his tile is lit, or a line of his since `t`). */
+  function tookTheWord(id, t) {
+    return Boolean(id) && Boolean(state.get(id)?.present) && (litIds.includes(id) || spokeSince(id, t));
+  }
+
+  /**
+   * Agent mode: the next speaker began on his own over «Спасибо» / «Дальше, X», or before they could play
+   * (review 28.09, P2; live 29.09): his turn, without the line — not a revert to the previous speaker.
+   */
+  function silentHandoff(prev, to, where) {
+    ev('turn.handoff_silent', { from: prev ?? null, to, where });
+    if (prev && state.current === prev) state.finishTurn({ t: nowMs(), status: prevStatus(prev, flow.turnEnd) });
+    beginTurn(to);
+    conductor?.speakerStarted?.(to);
   }
 
   /** Transcript of the current turn (lines since the word was given). */
@@ -1077,6 +1109,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     const withAck = engagement.ack !== false && Boolean(prev) && !['no_speech', 'speaker_left'].includes(reason);
     const te = { at: wall(), prev, to, reason, phase: state.phase };
     flow.turnEnd = te;
+    const decidedAt = wall();
     note('turn_end', { who: prev, reason, to });
     ev('turn.end', { who: prev, reason, to, ack: withAck, plan });
     const proceed = () => {
@@ -1092,6 +1125,7 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
       if (agentMode && flow.turnEnd !== te) return; // a newer decision replaced this turn change (review 28.09)
       // mostly heard is heard: a re-decided handoff does not thank again (review 28.09)
       if (r.status === 'completed' || r.status === 'shadow' || (r.status === 'aborted' && (r.played_ratio ?? 0) >= 0.5)) flow.lastAckFor = prev;
+      if (agentMode && (r.status === 'aborted' || dropped(r)) && tookTheWord(to, decidedAt)) return silentHandoff(prev, to, 'ack');
       if (r.status === 'aborted') return revertTurnEnd('barge_in_during_ack');
       if (dropped(r)) return revertTurnEnd('dropped_ack');
       proceed();
@@ -1110,10 +1144,12 @@ export function createHost({ settings, flags = {}, log, deps = {} }) {
     const prev = state.current;
     if (!flow.turnEnd) flow.turnEnd = { at: wall(), prev, to, reason, phase: state.phase };
     const te = flow.turnEnd;
+    const decidedAt = wall();
     const key = handoffKey(to, plain);
     ev('turn.handoff', { from: prev, to, key, reason, text: text ?? null });
     say({ key: text ? null : key, text, person: to, kind: 'handoff', gapBeforeMs: gap ? ACK_GAP_MS : 0, meta: { from: prev, to } }, (r) => {
       if (agentMode && flow.turnEnd !== te) return; // a newer decision replaced this turn change (review 28.09)
+      if (agentMode && (r.status === 'aborted' || dropped(r)) && tookTheWord(to, decidedAt)) return silentHandoff(prev, to, 'handoff');
       if (r.status === 'aborted') return revertTurnEnd('barge_in_during_handoff');
       if (dropped(r)) return revertTurnEnd('dropped_handoff');
       if (r.status === 'skipped' && r.reason === 'room_active') return postponeTurnEnd(to);

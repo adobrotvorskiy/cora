@@ -262,6 +262,11 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
     resetLadder(t);
   }
 
+  /** The host gave the word to someone who had already started talking (no handoff line): he has spoken in his turn. */
+  function speakerStarted(id) {
+    if (state.current === id) spokeIn = id;
+  }
+
   /** The host undid what she started (a turn change reverted, the opening line dropped): the agent hears it next time. */
   function undone({ what, why = null } = {}) {
     push({ type: 'undone', what, ...(why ? { why } : {}) });
@@ -543,7 +548,9 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
       case 'give_word':
         if (state.get(a.person)?.status === 'spoke') return 'already_spoke';
         if (a.person !== sit.speaker && speakerNotStarted(sit, ctx, t)) return 'speaker_not_started';
-        if (a.text && namesSomeoneElse(a.text, sit, a.person)) return 'text_names_someone_else';
+        // the word to someone else: only when the text does not name the one getting it (live 29.09: «Поняла,
+        // спасибо, Тима. Глеб, передаю тебе слово!» — a thanks to the last speaker — was refused)
+        if (a.text && !namesPerson(a.text, a.person) && namesSomeoneElse(a.text, sit, a.person)) return 'text_names_someone_else';
         return null;
       case 'ask_done':
         if (spokeIn !== a.person) return 'not_started'; // «Глеб, всё?» to someone who has not said a word yet
@@ -646,6 +653,7 @@ export function createConductor({ state, agent, io, now, log = null, leadId = nu
     heard,
     herLine,
     undone,
+    speakerStarted,
     interrupted,
     chorus,
     joined,
